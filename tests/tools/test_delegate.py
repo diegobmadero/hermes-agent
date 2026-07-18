@@ -265,6 +265,24 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertEqual(mock_run.call_args.kwargs["timeout_seconds"], 1200.0)
 
+    @patch("tools.delegate_tool._get_child_timeout", return_value=600.0)
+    @patch("tools.delegate_tool._run_single_child")
+    def test_omitted_timeout_uses_configured_child_timeout(
+        self, mock_run, _mock_get_timeout
+    ):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Done!",
+            "api_calls": 3,
+            "duration_seconds": 5.0,
+        }
+        parent = _make_mock_parent()
+
+        delegate_task(goal="Use configured cap", parent_agent=parent)
+
+        self.assertEqual(mock_run.call_args.kwargs["timeout_seconds"], 600.0)
+
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):
         mock_run.side_effect = [
@@ -317,6 +335,25 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(by_index[1], 1800.0)
 
     @patch("tools.delegate_tool._run_single_child")
+    def test_per_task_none_inherits_top_level_timeout(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "Done!",
+            "api_calls": 3,
+            "duration_seconds": 5.0,
+        }
+        parent = _make_mock_parent()
+
+        delegate_task(
+            tasks=[{"goal": "Inherit cap", "timeout_seconds": None}],
+            timeout_seconds=900,
+            parent_agent=parent,
+        )
+
+        self.assertEqual(mock_run.call_args.kwargs["timeout_seconds"], 900.0)
+
+    @patch("tools.delegate_tool._run_single_child")
     def test_invalid_timeout_override_rejected(self, mock_run):
         parent = _make_mock_parent()
 
@@ -331,6 +368,49 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("timeout_seconds must be a number", result["error"])
         mock_run.assert_not_called()
+
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_invalid_timeout_values_rejected_before_child_build(self, mock_build):
+        parent = _make_mock_parent()
+        invalid_values = [
+            True,
+            False,
+            "120",
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            {},
+            [],
+        ]
+
+        for location in ("top-level", "per-task"):
+            for value in invalid_values:
+                with self.subTest(location=location, value=value):
+                    if location == "top-level":
+                        result = json.loads(
+                            delegate_task(
+                                goal="Reject invalid cap",
+                                timeout_seconds=value,
+                                parent_agent=parent,
+                            )
+                        )
+                    else:
+                        result = json.loads(
+                            delegate_task(
+                                tasks=[
+                                    {
+                                        "goal": "Reject invalid cap",
+                                        "timeout_seconds": value,
+                                    }
+                                ],
+                                parent_agent=parent,
+                            )
+                        )
+
+                    self.assertIn("error", result)
+
+        mock_build.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
     def test_zero_timeout_override_disables_call_timeout(self, mock_run):
@@ -2270,7 +2350,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         with patch(
             "tools.delegate_tool._dump_subagent_timeout_diagnostic",
             return_value="/tmp/subagent-timeout-test.log",
-        ):
+        ) as mock_dump:
             started = time.monotonic()
             result = _run_single_child(
                 task_index=0,
@@ -2286,6 +2366,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertEqual(result["api_calls"], 0)
         self.assertEqual(result["diagnostic_path"], "/tmp/subagent-timeout-test.log")
         self.assertIn("0.05s", result["error"])
+        self.assertEqual(mock_dump.call_args.kwargs["timeout_seconds"], 0.05)
         self.assertTrue(interrupted.wait(timeout=0.5))
         self.assertLess(elapsed, 0.75)
 

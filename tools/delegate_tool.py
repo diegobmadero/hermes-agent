@@ -20,6 +20,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 import os
@@ -478,13 +479,16 @@ def _parse_child_timeout_override(
     """
     if value is _CHILD_TIMEOUT_UNSET:
         return _CHILD_TIMEOUT_UNSET, None
-    if value is None or value == "":
+    if value is None:
         return _CHILD_TIMEOUT_UNSET, None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return _CHILD_TIMEOUT_UNSET, f"{field_name} must be a number of seconds."
-    return (None if parsed <= 0 else max(30.0, parsed)), None
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        return _CHILD_TIMEOUT_UNSET, f"{field_name} must be finite."
+    if parsed < 0:
+        return _CHILD_TIMEOUT_UNSET, f"{field_name} must not be negative."
+    return (None if parsed == 0 else max(30.0, parsed)), None
 
 
 def _get_max_spawn_depth() -> int:
@@ -2538,7 +2542,13 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
-    task_timeout_overrides = []
+    configured_child_timeout = _get_child_timeout()
+    top_effective_timeout = (
+        configured_child_timeout
+        if top_timeout_override is _CHILD_TIMEOUT_UNSET
+        else top_timeout_override
+    )
+    task_timeouts = []
     for i, task in enumerate(task_list):
         if "timeout_seconds" in task:
             task_timeout_override, timeout_error = _parse_child_timeout_override(
@@ -2547,8 +2557,12 @@ def delegate_task(
             if timeout_error:
                 return tool_error(timeout_error)
         else:
-            task_timeout_override = top_timeout_override
-        task_timeout_overrides.append(task_timeout_override)
+            task_timeout_override = _CHILD_TIMEOUT_UNSET
+        task_timeouts.append(
+            top_effective_timeout
+            if task_timeout_override is _CHILD_TIMEOUT_UNSET
+            else task_timeout_override
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2570,7 +2584,7 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
-            task_timeout_override = task_timeout_overrides[i]
+            task_timeout = task_timeouts[i]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2597,7 +2611,7 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child, task_timeout_override))
+            children.append((i, t, child, task_timeout))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
