@@ -6,7 +6,21 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
+import re
 from typing import Callable
+
+
+_FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def normalize_expected_sha(value: str) -> str:
+    """Validate and normalize an expected Git commit SHA."""
+    if _FULL_SHA_RE.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "expected SHA must be exactly 40 hexadecimal characters"
+        )
+    return value.lower()
 
 
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
@@ -59,6 +73,16 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "If the local checkout is on a different branch, hermes will "
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."
+        ),
+    )
+    update_parser.add_argument(
+        "--expected-sha",
+        type=normalize_expected_sha,
+        default=None,
+        metavar="SHA",
+        help=(
+            "Require the fetched update branch to resolve to this exact commit "
+            "and advance only by fast-forward"
         ),
     )
     update_parser.add_argument(

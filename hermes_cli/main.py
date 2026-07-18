@@ -9952,6 +9952,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
+        expected_sha = getattr(args, "expected_sha", None)
+        if expected_sha is not None:
+            expected_sha = expected_sha.lower()
+            remote_result = subprocess.run(
+                git_cmd + ["rev-parse", f"origin/{branch}"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            remote_sha = remote_result.stdout.strip().lower()
+            if remote_result.returncode != 0 or remote_sha != expected_sha:
+                print(f"✗ Fetched origin/{branch} does not match expected SHA.")
+                if remote_sha:
+                    print(f"  Fetched:  {remote_sha}")
+                print(f"  Expected: {expected_sha}")
+                sys.exit(1)
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -10027,7 +10044,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        if commit_count == 0 and expected_sha is None:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
@@ -10116,13 +10133,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
+            if expected_sha is not None:
+                pull_result = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
             if pull_result.returncode != 0:
+                if expected_sha is not None:
+                    print(f"✗ Failed to fast-forward to origin/{branch}.")
+                    if pull_result.stderr.strip():
+                        print(f"  {pull_result.stderr.strip()}")
+                    sys.exit(1)
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.
@@ -10142,6 +10172,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
+                    sys.exit(1)
+
+            if expected_sha is not None:
+                updated_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
+                if updated_sha is None or updated_sha.lower() != expected_sha:
+                    print("✗ Updated HEAD does not match expected SHA.")
+                    if updated_sha:
+                        print(f"  HEAD:     {updated_sha.lower()}")
+                    print(f"  Expected: {expected_sha}")
                     sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
