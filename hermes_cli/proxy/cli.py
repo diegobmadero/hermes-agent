@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from typing import Any
 
@@ -16,6 +17,33 @@ from hermes_cli.proxy.server import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_proxy_logging() -> None:
+    proxy_logger = logging.getLogger("hermes_cli.proxy")
+    if not any(
+        getattr(handler, "_hermes_proxy_handler", False)
+        for handler in proxy_logger.handlers
+    ):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        handler._hermes_proxy_handler = True  # type: ignore[attr-defined]
+        proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    proxy_logger.propagate = False
+
+
+def _timeout_from_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
 
 
 def _print_aiohttp_missing() -> None:
@@ -54,6 +82,12 @@ def cmd_proxy_start(args: Any) -> int:
 
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
+    try:
+        connect_timeout = _timeout_from_env("HERMES_PROXY_CONNECT_TIMEOUT_SECONDS", 15)
+        read_timeout = _timeout_from_env("HERMES_PROXY_READ_TIMEOUT_SECONDS", 300)
+    except ValueError as exc:
+        print(f"proxy: invalid timeout configuration: {exc}", file=sys.stderr)
+        return 2
 
     print(
         f"Starting Hermes proxy for {adapter.display_name}\n"
@@ -65,8 +99,17 @@ def cmd_proxy_start(args: Any) -> int:
         file=sys.stderr,
     )
 
+    _configure_proxy_logging()
     try:
-        asyncio.run(run_server(adapter, host=host, port=port))
+        asyncio.run(
+            run_server(
+                adapter,
+                host=host,
+                port=port,
+                upstream_sock_connect_seconds=connect_timeout,
+                upstream_sock_read_seconds=read_timeout,
+            )
+        )
     except KeyboardInterrupt:
         print("\nproxy: stopped", file=sys.stderr)
     except OSError as exc:
