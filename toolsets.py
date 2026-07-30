@@ -250,6 +250,18 @@ TOOLSETS = {
         "includes": []
     },
 
+    "model_switch": {
+        "description": (
+            "Let the agent switch its own model for complexity routing. "
+            "Double opt-in: off by default (not in _HERMES_CORE_TOOLS — zero "
+            "schema footprint unless wanted; enable in `hermes tools` → "
+            "Model Switch) AND gated on agent.allow_self_model_switch in "
+            "config.yaml via check_fn."
+        ),
+        "tools": ["model_switch"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],

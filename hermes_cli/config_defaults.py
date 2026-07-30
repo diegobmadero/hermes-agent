@@ -170,6 +170,17 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
+        # Master switch for the agent-callable model_switch tool. Off by
+        # default: self-model-switching is cost-affecting, so it needs BOTH
+        # this flag (check_fn gates the schema) and the model_switch toolset
+        # enabled per platform (`hermes tools` → Model Switch).
+        "allow_self_model_switch": False,
+        # Optional restriction for model_switch targets. Non-empty list =
+        # only these models (raw slug or resolved id, case-insensitive) may
+        # be targeted, and allowlisted targets skip the expensive-model cost
+        # guard. Empty = any resolvable model EXCEPT ones the cost guard
+        # flags as expensive (those always need an allowlist entry).
+        "model_switch_allowlist": [],
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

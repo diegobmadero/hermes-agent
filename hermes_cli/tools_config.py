@@ -112,6 +112,7 @@ CONFIGURABLE_TOOLSETS = [
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("reasoning",       "🧠 Reasoning Effort",          "reasoning_effort"),
+    ("model_switch",    "🔀 Model Switch",              "agent-driven model routing"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
@@ -157,7 +158,7 @@ def gui_toolset_label(label: str) -> str:
 # (a new default core schema entry is permanent footprint on every request —
 # see AGENTS.md footprint ladder), so users enable it per platform via
 # `hermes tools` → Reasoning Effort.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "reasoning"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "reasoning", "model_switch"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
