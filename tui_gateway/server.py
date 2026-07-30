@@ -5326,6 +5326,43 @@ def _make_reasoning_update_callback(sid: str):
     return _callback
 
 
+def _make_model_update_callback(sid: str):
+    """Platform hook for the model_switch tool (TUI/desktop surface).
+
+    ``agent.switch_model`` already swapped the live agent; recording the same
+    per-session ``model_override`` the /model handler writes makes the switch
+    survive a session rebuild (/new, resume) and keeps
+    ``_sync_agent_model_with_config`` from re-adopting the config model at
+    the next turn start. Session scope only — turn scope reverts in-process
+    via the conversation loop and must leave session state untouched. Never
+    persists to config.yaml.
+    """
+
+    def _callback(old_model: str, override: dict, scope: str = "session") -> None:
+        if scope != "session":
+            return
+        with _sessions_lock:
+            session = _sessions.get(sid)
+        if session is None:
+            return
+        session["model_override"] = {
+            "model": override.get("model"),
+            "provider": override.get("provider"),
+            "base_url": override.get("base_url"),
+            "api_key": override.get("api_key"),
+            "api_mode": override.get("api_mode"),
+        }
+        agent = session.get("agent")
+        if agent is not None:
+            try:
+                _persist_live_session_runtime(session)
+                _emit("session.info", sid, _session_info(agent, session))
+            except Exception:
+                logger.debug("failed to publish model switch", exc_info=True)
+
+    return _callback
+
+
 def _agent_cbs(sid: str) -> dict:
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
@@ -6179,6 +6216,7 @@ def _make_agent(
         # TUI/desktop `persist: true` (or any tool-set level on a rebuilt
         # session) is silently dropped. See _make_reasoning_update_callback.
         reasoning_update_callback=_make_reasoning_update_callback(sid),
+        model_update_callback=_make_model_update_callback(sid),
         **_agent_cbs(sid),
     )
 

@@ -4565,6 +4565,13 @@ class TurnRunner:
         agent.reasoning_update_callback = self._runner._make_reasoning_update_callback(
             ctx.session_key
         )
+        # Session-scoped hook for the model_switch tool. Without it, the
+        # post-run fallback check treats a tool-initiated switch as an
+        # accidental fallback (no matching /model override) and evicts the
+        # cached agent — silently reverting the switch on the next message.
+        agent.model_update_callback = self._runner._make_model_update_callback(
+            ctx.session_key
+        )
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Must-deliver notes for THIS turn ride the current user message
@@ -7927,6 +7934,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._set_session_reasoning_override(session_key, parsed_config)
             self._reasoning_config = dict(parsed_config)
             return False
+
+        return _callback
+
+    def _make_model_update_callback(self, session_key: str):
+        """Build the model_update_callback for an agent bound to *session_key*.
+
+        ``AIAgent.switch_model`` already swapped the live agent, but two
+        gateway rails would undo that on the next message without a session
+        override: turn-route resolution re-derives the model from config +
+        ``_session_model_overrides``, and the post-run fallback check evicts
+        any cached agent whose model differs from the resolved one unless
+        ``_is_intentional_model_switch`` matches it against the override.
+        Storing the same override dict the /model handler writes makes the
+        tool switch first-class: no eviction, no MCP reinit, /model shows
+        the active model. Turn scope deliberately stores nothing — the
+        conversation loop reverts in-process, and if the agent is evicted
+        first the rebuild lands on the pre-switch model anyway.
+
+        In-memory only (like session reasoning overrides): an agent-initiated
+        switch does not survive a gateway restart, by design — /model's
+        session-store write-through stays a user-command privilege.
+        """
+
+        def _callback(old_model: str, override: dict, scope: str = "session") -> None:
+            if scope != "session" or not session_key:
+                return
+            self._session_model_overrides[session_key] = {
+                "model": override.get("model"),
+                "provider": override.get("provider"),
+                "api_key": override.get("api_key"),
+                "base_url": override.get("base_url"),
+                "api_mode": override.get("api_mode"),
+            }
 
         return _callback
 
@@ -18601,6 +18641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 _reasoning_session_key = ""
             reasoning_update_callback = self._make_reasoning_update_callback(_reasoning_session_key)
+            model_update_callback = self._make_model_update_callback(_reasoning_session_key)
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
@@ -18633,6 +18674,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
                     reasoning_update_callback=reasoning_update_callback,
+                    model_update_callback=model_update_callback,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),

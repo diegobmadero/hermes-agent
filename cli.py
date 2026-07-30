@@ -6264,6 +6264,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
         return save_config_value("agent.reasoning_effort", level)
 
+    def _on_model_update(self, old_model: str, override: dict, scope: str = "session") -> None:
+        """Platform hook for the model_switch tool (session scope only).
+
+        ``agent.switch_model`` already swapped the live agent in place; this
+        mirrors the /model handler's CLI-state sync so the status line and
+        any later agent re-init derive the switched model instead of
+        silently reverting to the pre-switch runtime. Never persists to
+        config.yaml — /model --global stays the only durable path.
+        """
+        if scope != "session":
+            return
+        self.model = override.get("model") or self.model
+        provider = override.get("provider")
+        if provider:
+            self.provider = provider
+            self.requested_provider = provider
+        # Overwrite explicit overrides unconditionally so stale credentials
+        # from the previous provider don't leak into the next resolution
+        # (same rationale as the /model handler).
+        self._explicit_api_key = override.get("api_key")
+        self._explicit_base_url = override.get("base_url")
+        if override.get("api_key"):
+            self.api_key = override.get("api_key")
+        if override.get("base_url"):
+            self.base_url = override.get("base_url")
+        if override.get("api_mode"):
+            self.api_mode = override.get("api_mode")
+
     # ── Streaming display ────────────────────────────────────────────────
 
     def _current_reasoning_callback(self):
