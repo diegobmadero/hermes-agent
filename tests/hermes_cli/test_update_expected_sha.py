@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd as hermes_update_cmd
 from hermes_cli.subcommands.update import build_update_parser
 
 
@@ -29,10 +30,13 @@ def _setup_update(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda args: None)
     monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: [])
-    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *args: None)
     monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *args: "https://github.com/example/repo.git")
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *args: None)
-    monkeypatch.setattr(hermes_main, "_invalidate_update_cache", lambda: None)
+    # The update implementation moved to hermes_cli.update_cmd; helpers called
+    # via its _m() indirection stay patchable on hermes_cli.main (above), but
+    # module-local calls must be patched on update_cmd itself.
+    monkeypatch.setattr(hermes_update_cmd, "_discard_lockfile_churn", lambda *args: None)
+    monkeypatch.setattr(hermes_update_cmd, "_invalidate_update_cache", lambda: None)
 
 
 def test_expected_sha_parser_normalizes_and_rejects_invalid_values():
@@ -62,9 +66,12 @@ def test_expected_sha_mismatch_stops_before_checkout_stash_or_advance(
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd == ["git", "rev-parse", f"origin/{BRANCH}"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{OTHER}\n", stderr="")
+        if cmd and cmd[0] != "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command after mismatch: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_update_cmd.subprocess, "run", fake_run)
 
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(
@@ -86,7 +93,7 @@ def test_guarded_update_uses_single_fetch_ff_only_merge_and_checks_head(
         pass
 
     monkeypatch.setattr(
-        hermes_main,
+        hermes_update_cmd,
         "_validate_critical_files_syntax",
         lambda root: (_ for _ in ()).throw(ReachedSyntaxGuard()),
     )
@@ -109,9 +116,12 @@ def test_guarded_update_uses_single_fetch_ff_only_merge_and_checks_head(
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{value}\n", stderr="")
         if cmd == ["git", "merge", "--ff-only", f"origin/{BRANCH}"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="Updating\n", stderr="")
+        if cmd and cmd[0] != "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_update_cmd.subprocess, "run", fake_run)
 
     with pytest.raises(ReachedSyntaxGuard):
         hermes_main.cmd_update(
@@ -142,9 +152,12 @@ def test_guarded_ff_only_failure_never_uses_reset(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{OTHER}\n", stderr="")
         if cmd == ["git", "merge", "--ff-only", f"origin/{BRANCH}"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="diverged\n")
+        if cmd and cmd[0] != "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_update_cmd.subprocess, "run", fake_run)
 
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(
@@ -173,9 +186,12 @@ def test_guarded_update_rejects_post_merge_head_mismatch(monkeypatch, tmp_path, 
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{OTHER}\n", stderr="")
         if cmd == ["git", "merge", "--ff-only", f"origin/{BRANCH}"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd and cmd[0] != "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    monkeypatch.setattr(hermes_update_cmd.subprocess, "run", fake_run)
 
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(
