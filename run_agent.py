@@ -418,6 +418,7 @@ class AIAgent:
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
+    _reasoning_config_is_runtime_override: bool
 
     @property
     def base_url(self) -> str:
@@ -479,6 +480,7 @@ class AIAgent:
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
+        reasoning_config_is_runtime_override: bool = False,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -565,6 +567,7 @@ class AIAgent:
             reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
+            reasoning_config_is_runtime_override=reasoning_config_is_runtime_override,
             service_tier=service_tier,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
@@ -6955,6 +6958,16 @@ class AIAgent:
                     logger.warning("reasoning_update_callback failed: %s", cb_err)
             if not no_change:
                 self.reasoning_config = parsed_config
+            # A non-persisted change is a live/session override and must
+            # survive a later model switch. A successfully persisted change
+            # returns to normal config precedence for the destination model.
+            self._reasoning_config_is_runtime_override = not persisted
+            primary_runtime = getattr(self, "_primary_runtime", None)
+            if isinstance(primary_runtime, dict):
+                primary_runtime["reasoning_config"] = dict(parsed_config)
+                primary_runtime["reasoning_config_is_runtime_override"] = (
+                    self._reasoning_config_is_runtime_override
+                )
             enabled = parsed_config.get("enabled") is not False
             message = (
                 f"Reasoning effort already at {level}"

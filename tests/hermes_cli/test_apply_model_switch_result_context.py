@@ -13,6 +13,7 @@ Fix: both display paths now go through ``resolve_display_context_length()``.
 """
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import patch
 
 from hermes_cli.model_switch import ModelSwitchResult
@@ -31,7 +32,10 @@ class _FakeModelInfo:
 
 class _StubCLI:
     """Minimum attrs ``_apply_model_switch_result`` reads on ``self``."""
-    agent = None
+    agent: Any = None
+    conversation_history: list = []
+    reasoning_config: dict | None = None
+    _reasoning_config_is_runtime_override = False
     model = ""
     provider = ""
     requested_provider = ""
@@ -41,6 +45,14 @@ class _StubCLI:
     _explicit_base_url = ""
     api_mode = ""
     _pending_model_switch_note = ""
+
+    def _sync_reasoning_state_from_agent(self):
+        if self.agent is None:
+            return
+        self.reasoning_config = self.agent.reasoning_config
+        self._reasoning_config_is_runtime_override = bool(
+            self.agent._reasoning_config_is_runtime_override
+        )
 
 
 def _run_display(monkeypatch, result):
@@ -169,3 +181,45 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
         cli_mod.HermesCLI._apply_model_switch_result(cli, result, True)
 
     assert ("model.context_length", None) in writes
+
+
+def test_picker_switch_syncs_cli_reasoning_state_from_live_agent(monkeypatch):
+    import cli as cli_mod
+
+    class _SwitchingAgent:
+        reasoning_config = {"enabled": True, "effort": "xhigh"}
+        _reasoning_config_is_runtime_override = True
+        _custom_providers = None
+        _config_context_length = None
+
+        def switch_model(self, **_kwargs):
+            self.reasoning_config = {"enabled": True, "effort": "low"}
+            self._reasoning_config_is_runtime_override = False
+
+    cli = _StubCLI()
+    cli.agent = _SwitchingAgent()
+    cli.conversation_history = []
+    cli.reasoning_config = {"enabled": True, "effort": "medium"}
+    cli._reasoning_config_is_runtime_override = False
+    result = ModelSwitchResult(
+        success=True,
+        new_model="target-model",
+        target_provider="openrouter",
+        provider_changed=False,
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        warning_message="",
+        provider_label="OpenRouter",
+        resolved_via_alias=False,
+        capabilities=None,
+        model_info=None,
+        is_global=False,
+    )
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli_mod, "save_config_value", lambda *_a, **_k: None)
+
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, False)
+
+    assert cli.reasoning_config == {"enabled": True, "effort": "low"}
+    assert cli._reasoning_config_is_runtime_override is False

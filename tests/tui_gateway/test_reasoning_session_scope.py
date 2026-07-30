@@ -167,6 +167,7 @@ class TestReasoningUpdateCallback:
                 "xhigh", {"enabled": True, "effort": "xhigh"}, False
             )
         assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        assert agent._reasoning_config_is_runtime_override is True
         persist_rt.assert_called_once_with(session)
         assert emit.call_args.args[0] == "session.info"
 

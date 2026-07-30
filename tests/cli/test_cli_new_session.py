@@ -30,6 +30,8 @@ class _FakeAgent:
         self.session_id = session_id
         self.session_start = session_start
         self.model = "anthropic/claude-opus-4.6"
+        self.reasoning_config: dict | None = None
+        self._reasoning_config_is_runtime_override = False
         self._last_flushed_db_idx = 7
         self._todo_store = TodoStore()
         self._todo_store.write(
@@ -175,8 +177,41 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_session_clears_runtime_reasoning_and_restores_per_model_config(tmp_path):
+    model = "anthropic/claude-opus-4.6"
+    config = {
+        "model": {
+            "default": model,
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "agent": {
+            "reasoning_effort": "medium",
+            "reasoning_overrides": {model: "high"},
+        },
+    }
+    cli = _make_cli(config_overrides=config)
+    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db.create_session(
+        session_id=cli.session_id,
+        source="cli",
+        model=cli.model,
+    )
+    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
+    cli.reasoning_config = {"enabled": True, "effort": "xhigh"}
+    cli._reasoning_config_is_runtime_override = True
+    cli.agent.reasoning_config = cli.reasoning_config
+    cli.agent._reasoning_config_is_runtime_override = True
+    cli.conversation_history = []
 
+    with patch.dict(cli.new_session.__func__.__globals__, {"CLI_CONFIG": config}):
+        cli.new_session(silent=True)
 
+    expected = {"enabled": True, "effort": "high"}
+    assert cli.reasoning_config == expected
+    assert cli._reasoning_config_is_runtime_override is False
+    assert cli.agent.reasoning_config == expected
+    assert cli.agent._reasoning_config_is_runtime_override is False
 
 
 def test_new_session_delivers_context_engine_boundary_synchronously(tmp_path):

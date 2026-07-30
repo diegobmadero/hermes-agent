@@ -33,6 +33,14 @@ class _StubCLI:
     def _confirm_expensive_model_switch(self, result):
         return True
 
+    def _sync_reasoning_state_from_agent(self):
+        if self.agent is None:
+            return
+        self.reasoning_config = getattr(self.agent, "reasoning_config", None)
+        self._reasoning_config_is_runtime_override = bool(
+            getattr(self.agent, "_reasoning_config_is_runtime_override", False)
+        )
+
 
 def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     import cli as cli_mod

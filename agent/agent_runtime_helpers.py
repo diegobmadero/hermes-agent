@@ -1622,6 +1622,10 @@ def restore_primary_runtime(agent) -> bool:
         saved_reasoning = rt.get("reasoning_config")
         if saved_reasoning is not None:
             agent.reasoning_config = dict(saved_reasoning)
+        if "reasoning_config_is_runtime_override" in rt:
+            agent._reasoning_config_is_runtime_override = bool(
+                rt["reasoning_config_is_runtime_override"]
+            )
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
@@ -2430,23 +2434,31 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
-    # ── Re-resolve reasoning_config from per-model override ──
-    # The new model may have a different reasoning_effort override. Re-read
-    # config so the override takes effect immediately on /model switch —
-    # resolved through the shared chokepoint (per-model > global; YAML
-    # boolean False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-
-        _reasoning_cfg = _sm_load_config() or {}
-        agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
+    # ── Resolve reasoning_config for the destination model ──
+    # Session/runtime reasoning overrides outrank per-model and global config.
+    # Without this guard, switching models immediately clobbers a level set by
+    # /reasoning or the reasoning_effort tool for the current session. When no
+    # runtime override is active, preserve the existing /model contract and
+    # resolve the destination model's configured override.
+    if getattr(agent, "_reasoning_config_is_runtime_override", False):
         logger.info(
-            "switch_model: reasoning_config resolved for %s: %s",
-            agent.model, agent.reasoning_config,
+            "switch_model: preserving runtime reasoning_config for %s: %s",
+            agent.model,
+            agent.reasoning_config,
         )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+    else:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+
+            _reasoning_cfg = _sm_load_config() or {}
+            agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s",
+                agent.model, agent.reasoning_config,
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -2472,6 +2484,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+        "reasoning_config_is_runtime_override": bool(
+            getattr(agent, "_reasoning_config_is_runtime_override", False)
+        ),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",

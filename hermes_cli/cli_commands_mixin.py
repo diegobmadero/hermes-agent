@@ -1913,6 +1913,9 @@ class CLICommandsMixin:
                     platform="cli",
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
+                    reasoning_config_is_runtime_override=getattr(
+                        self, "_reasoning_config_is_runtime_override", False
+                    ),
                     reasoning_update_callback=self._on_reasoning_update,
                     model_update_callback=self._on_model_update,
                     service_tier=self.service_tier,
@@ -3001,9 +3004,14 @@ class CLICommandsMixin:
             return
 
         self.reasoning_config = parsed
+        # Session-scoped effort must outrank per-model/global config if the
+        # session later switches models. A successful --global write returns
+        # to normal config precedence; a failed write remains session-scoped.
+        persisted = explicit_global and save_config_value("agent.reasoning_effort", arg)
+        self._reasoning_config_is_runtime_override = not persisted
         self.agent = None  # Force agent re-init with new reasoning config
 
-        if explicit_global and save_config_value("agent.reasoning_effort", arg):
+        if persisted:
             agent_cfg = CLI_CONFIG.get("agent")
             if not isinstance(agent_cfg, dict):
                 agent_cfg = {}

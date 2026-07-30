@@ -25,6 +25,7 @@ class TestSwitchModelReasoningOverride:
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
         agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent._reasoning_config_is_runtime_override = False
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._fallback_chain = []
@@ -42,6 +43,60 @@ class TestSwitchModelReasoningOverride:
         agent._ensure_lmstudio_runtime_loaded = MagicMock()
         agent._create_openai_client = MagicMock(return_value=MagicMock())
         return agent
+
+    def test_runtime_reasoning_override_survives_model_switch(self):
+        """A session/tool effort override must outrank target-model config."""
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        agent._reasoning_config_is_runtime_override = True
+        fake_cfg = {
+            "agent": {
+                "reasoning_effort": "minimal",
+                "reasoning_overrides": {"claude-opus-4.5": "low"},
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=fake_cfg):
+            switch_model(
+                agent,
+                new_model="claude-opus-4.5",
+                new_provider="anthropic",
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+            )
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
+    def test_model_switch_resolves_target_config_without_runtime_override(self):
+        """Configured per-model effort still applies when no session override exists."""
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+        fake_cfg = {
+            "agent": {
+                "reasoning_effort": "minimal",
+                "reasoning_overrides": {"claude-opus-4.5": "low"},
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=fake_cfg):
+            switch_model(
+                agent,
+                new_model="claude-opus-4.5",
+                new_provider="anthropic",
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+            )
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
     def test_primary_runtime_includes_reasoning_config(self):
         """After switch_model, _primary_runtime should contain reasoning_config key."""

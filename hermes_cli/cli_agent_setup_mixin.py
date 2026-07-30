@@ -377,6 +377,9 @@ class CLIAgentSetupMixin:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
+                reasoning_config_is_runtime_override=getattr(
+                    self, "_reasoning_config_is_runtime_override", False
+                ),
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,

@@ -30,7 +30,13 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
+def _make_agent(
+    fallback_model=None,
+    provider="custom",
+    base_url="https://my-llm.example.com/v1",
+    reasoning_config=None,
+    reasoning_config_is_runtime_override=False,
+):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
@@ -45,6 +51,10 @@ def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            reasoning_config=reasoning_config,
+            reasoning_config_is_runtime_override=(
+                reasoning_config_is_runtime_override
+            ),
         )
         agent.client = MagicMock()
         return agent
@@ -82,6 +92,19 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["compressor_provider"] == cc.provider
         assert rt["compressor_context_length"] == cc.context_length
         assert rt["compressor_threshold_tokens"] == cc.threshold_tokens
+
+    def test_snapshot_includes_reasoning_value_and_provenance(self):
+        reasoning = {"enabled": True, "effort": "xhigh"}
+        agent = _make_agent(
+            reasoning_config=reasoning,
+            reasoning_config_is_runtime_override=True,
+        )
+
+        assert agent._primary_runtime["reasoning_config"] == reasoning
+        assert (
+            agent._primary_runtime["reasoning_config_is_runtime_override"]
+            is True
+        )
 
     def test_snapshot_includes_anthropic_state_when_applicable(self):
         """Anthropic-mode agents should snapshot Anthropic-specific state."""
@@ -145,6 +168,44 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
+
+    def test_runtime_reasoning_override_survives_fallback_and_restore(self):
+        reasoning = {"enabled": True, "effort": "xhigh"}
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+            },
+            reasoning_config=reasoning,
+            reasoning_config_is_runtime_override=True,
+        )
+        mock_client = _mock_resolve()
+        fallback_cfg = {
+            "agent": {
+                "reasoning_effort": "low",
+                "reasoning_overrides": {
+                    "anthropic/claude-sonnet-4": "low",
+                },
+            }
+        }
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, None),
+            ),
+            patch("hermes_cli.config.load_config", return_value=fallback_cfg),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.reasoning_config == reasoning
+        assert agent._reasoning_config_is_runtime_override is True
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.reasoning_config == reasoning
+        assert agent._reasoning_config_is_runtime_override is True
 
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""

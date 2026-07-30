@@ -4484,6 +4484,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # shared chokepoint in hermes_constants (Closes #21256).
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        self._reasoning_config_is_runtime_override = False
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -6272,9 +6273,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns True when the value was durably saved.
         """
         self.reasoning_config = parsed_config
-        if not persist:
-            return False
-        return save_config_value("agent.reasoning_effort", level)
+        persisted = bool(
+            persist and save_config_value("agent.reasoning_effort", level)
+        )
+        self._reasoning_config_is_runtime_override = not persisted
+        return persisted
 
     def _on_model_update(self, old_model: str, override: dict, scope: str = "session") -> None:
         """Platform hook for the model_switch tool (session scope only).
@@ -8015,9 +8018,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
+        self._reasoning_config_is_runtime_override = False
+        if self.agent:
+            # Clear provenance before the config-default model reset below;
+            # otherwise switch_model would preserve the prior session's effort.
+            self.agent._reasoning_config_is_runtime_override = False
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
@@ -8080,12 +8085,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        from hermes_constants import resolve_reasoning_config
+
+        # Resolve after the model reset attempt so the fresh session receives
+        # the effective model's per-model override, falling back to the global
+        # configured effort only when no such override exists.
+        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         _sync_process_session_id(self.session_id)
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
+            self.agent._reasoning_config_is_runtime_override = False
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
@@ -8831,6 +8843,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._restore_modal_input_snapshot()
         self._invalidate(min_interval=0.0)
 
+    def _sync_reasoning_state_from_agent(self) -> None:
+        """Keep CLI reconstruction state aligned with the live agent runtime."""
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return
+        self.reasoning_config = copy.deepcopy(
+            getattr(agent, "reasoning_config", None)
+        )
+        self._reasoning_config_is_runtime_override = bool(
+            getattr(agent, "_reasoning_config_is_runtime_override", False)
+        )
+
     def _snapshot_model_runtime(self) -> dict:
         """Capture current CLI and agent model runtime for one-turn restore."""
         agent = getattr(self, "agent", None)
@@ -8876,6 +8900,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
+                    self._sync_reasoning_state_from_agent()
                     return
             except Exception:
                 logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
@@ -8889,6 +8914,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
                 )
+                self._sync_reasoning_state_from_agent()
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
 
@@ -9010,6 +9036,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                 )
+                self._sync_reasoning_state_from_agent()
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
                 # Roll the CLI's own staged fields back too and abort the rest
@@ -9354,6 +9381,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                 )
+                self._sync_reasoning_state_from_agent()
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
                 # failed switch is a no-op rather than a dead session (#50163).

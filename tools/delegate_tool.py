@@ -1458,9 +1458,15 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: delegation override > parent inherit. Carry the
+    # provenance bit with an inherited runtime override so a later child model
+    # switch cannot silently reset it. An explicit delegation-level effort is
+    # also authoritative for the child's lifetime.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
+    child_reasoning_is_runtime_override = bool(
+        getattr(parent_agent, "_reasoning_config_is_runtime_override", False)
+    )
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
@@ -1472,6 +1478,7 @@ def _build_child_agent(
             parsed = parse_reasoning_effort(delegation_effort)
             if parsed is not None:
                 child_reasoning = parsed
+                child_reasoning_is_runtime_override = True
             else:
                 logger.warning(
                     "Unknown delegation.reasoning_effort '%s', inheriting parent level",
@@ -1538,6 +1545,9 @@ def _build_child_agent(
             max_iterations=max_iterations,
 
             reasoning_config=child_reasoning,
+            reasoning_config_is_runtime_override=(
+                child_reasoning_is_runtime_override
+            ),
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
             fallback_model=parent_fallback,
             enabled_toolsets=child_toolsets,

@@ -4135,6 +4135,9 @@ class TurnRunner:
             session_key=ctx.session_key,
             model=model,
         )
+        reasoning_config_is_runtime_override = (
+            self._runner._session_has_reasoning_override(ctx.session_key)
+        )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -4461,6 +4464,9 @@ class TurnRunner:
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
+                reasoning_config_is_runtime_override=(
+                    reasoning_config_is_runtime_override
+                ),
                 service_tier=self._runner._service_tier,
                 request_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
@@ -4557,6 +4563,17 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        agent._reasoning_config_is_runtime_override = (
+            reasoning_config_is_runtime_override
+        )
+        primary_runtime = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary_runtime, dict):
+            primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if reasoning_config else None
+            )
+            primary_runtime["reasoning_config_is_runtime_override"] = (
+                reasoning_config_is_runtime_override
+            )
         # Session-scoped hook for the reasoning_effort tool. Without it,
         # the tool's mutation of agent.reasoning_config would be undone by
         # the reset one line above on the very next message; the callback
@@ -7827,6 +7844,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
         return self._load_reasoning_config(model)
+
+    def _session_has_reasoning_override(self, session_key: Optional[str]) -> bool:
+        """Return whether *session_key* currently owns an effort override."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        return bool(
+            state is not None
+            and state.conversation.reasoning_override is not None
+        )
 
     def _set_session_reasoning_override(
         self,
@@ -18640,6 +18667,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _reasoning_session_key = self._session_key_for_source(source)
             except Exception:
                 _reasoning_session_key = ""
+            reasoning_config_is_runtime_override = (
+                self._session_has_reasoning_override(_reasoning_session_key)
+            )
             reasoning_update_callback = self._make_reasoning_update_callback(_reasoning_session_key)
             model_update_callback = self._make_model_update_callback(_reasoning_session_key)
             self._service_tier = self._resolve_session_service_tier(source=source)
@@ -18673,6 +18703,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
+                    reasoning_config_is_runtime_override=(
+                        reasoning_config_is_runtime_override
+                    ),
                     reasoning_update_callback=reasoning_update_callback,
                     model_update_callback=model_update_callback,
                     service_tier=self._service_tier,

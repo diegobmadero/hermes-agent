@@ -1327,6 +1327,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
         parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        parent._reasoning_config_is_runtime_override = True
 
         _build_child_agent(
             task_index=0, goal="test", context=None, toolsets=None,
@@ -1335,6 +1336,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
+        self.assertTrue(call_kwargs["reasoning_config_is_runtime_override"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
@@ -1352,6 +1354,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+        self.assertTrue(call_kwargs["reasoning_config_is_runtime_override"])
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency

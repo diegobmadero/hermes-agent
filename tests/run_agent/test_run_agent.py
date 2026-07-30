@@ -78,6 +78,25 @@ def agent():
         return a
 
 
+def test_constructor_carries_runtime_reasoning_override_provenance():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        runtime_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            reasoning_config_is_runtime_override=True,
+        )
+
+    assert runtime_agent._reasoning_config_is_runtime_override is True
+
+
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
     agent._persist_user_message_idx = 0
@@ -5836,6 +5855,34 @@ class TestApplyReasoningEffort:
         assert result["success"] is True
         assert result["persisted"] is False
         assert calls == [("high", {"enabled": True, "effort": "high"}, False)]
+        assert agent._reasoning_config_is_runtime_override is True
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "high",
+        }
+        assert (
+            agent._primary_runtime["reasoning_config_is_runtime_override"]
+            is True
+        )
+
+    def test_persisted_reasoning_update_clears_runtime_override(self, agent):
+        agent._reasoning_config_is_runtime_override = True
+        agent.reasoning_update_callback = lambda *_args, **_kwargs: True
+
+        result = json.loads(
+            agent._apply_reasoning_effort({"level": "low", "persist": True})
+        )
+
+        assert result["persisted"] is True
+        assert agent._reasoning_config_is_runtime_override is False
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True,
+            "effort": "low",
+        }
+        assert (
+            agent._primary_runtime["reasoning_config_is_runtime_override"]
+            is False
+        )
 
     def test_persist_flag_reaches_callback(self, agent):
         calls = []

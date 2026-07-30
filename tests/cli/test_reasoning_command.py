@@ -101,6 +101,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
 
         save_config.assert_not_called()
         self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
+        self.assertTrue(stub._reasoning_config_is_runtime_override)
         self.assertIsNone(stub.agent)
 
 
@@ -122,6 +123,8 @@ class TestHandleReasoningCommand(unittest.TestCase):
             _resumed=False,
             reasoning_config={"enabled": True, "effort": "high"},
             _notify_session_boundary=MagicMock(),
+            # new_session re-resolves reasoning for the effective model.
+            model="session-model",
         )
 
         with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "medium"}):

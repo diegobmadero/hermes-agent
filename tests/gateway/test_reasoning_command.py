@@ -242,6 +242,7 @@ class TestReasoningUpdateCallback:
         persisted = callback("xhigh", {"enabled": True, "effort": "xhigh"}, False)
 
         assert persisted is False
+        assert runner._session_has_reasoning_override(session_key) is True
         # The next message resolves reasoning config through the session
         # override — this is what keeps the tool's change alive.
         assert runner._resolve_session_reasoning_config(source=source) == {

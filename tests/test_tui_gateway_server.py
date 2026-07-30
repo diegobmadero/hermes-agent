@@ -3463,6 +3463,23 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == chain
 
 
+def test_background_agent_kwargs_preserves_reasoning_override_provenance(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.5",
+        provider="openai-codex",
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        _reasoning_config_is_runtime_override=True,
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+
+    assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+    assert kwargs["reasoning_config_is_runtime_override"] is True
+
+
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.5",
@@ -6133,6 +6150,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_effort["result"]["value"] == "low"
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    assert agent._reasoning_config_is_runtime_override is True
     assert server._sessions["sid"]["create_reasoning_override"] == {"enabled": True, "effort": "low"}
     assert server._load_cfg()["agent"]["reasoning_effort"] == "medium"
 
@@ -6214,7 +6232,10 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
 def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
-    agent = types.SimpleNamespace(reasoning_config=None)
+    agent = types.SimpleNamespace(
+        reasoning_config=None,
+        _reasoning_config_is_runtime_override=True,
+    )
     server._sessions["sid"] = _session(agent=agent)
     server._sessions["sid"]["create_reasoning_override"] = {"enabled": True, "effort": "low"}
 
@@ -6234,6 +6255,7 @@ def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, mon
     assert resp["result"]["value"] == "high"
     assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
     assert "create_reasoning_override" not in server._sessions["sid"]
+    assert agent._reasoning_config_is_runtime_override is False
 
     status = server.handle_request(
         {"id": "2", "method": "config.get", "params": {"session_id": "sid", "key": "reasoning"}}
@@ -12805,6 +12827,7 @@ def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     assert mock_agent.call_args.kwargs["model"] == "gpt-5.4"
     assert mock_agent.call_args.kwargs["provider"] == "openai-codex"
     assert mock_agent.call_args.kwargs["reasoning_config"] == {"enabled": True, "effort": "high"}
+    assert mock_agent.call_args.kwargs["reasoning_config_is_runtime_override"] is True
     assert mock_agent.call_args.kwargs["service_tier"] == "priority"
 
 

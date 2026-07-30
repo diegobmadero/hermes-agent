@@ -5316,6 +5316,13 @@ def _make_reasoning_update_callback(sid: str):
                 # footer emit below and the durable session row both see the
                 # new level, not the pre-tool one.
                 agent.reasoning_config = parsed_config
+                agent._reasoning_config_is_runtime_override = not persisted
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    primary_runtime["reasoning_config"] = dict(parsed_config)
+                    primary_runtime["reasoning_config_is_runtime_override"] = (
+                        not persisted
+                    )
                 try:
                     _persist_live_session_runtime(session)
                     _emit("session.info", sid, _session_info(agent, session))
@@ -5718,6 +5725,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
+        "reasoning_config_is_runtime_override": bool(
+            getattr(agent, "_reasoning_config_is_runtime_override", False)
+        ),
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
@@ -6188,6 +6198,7 @@ def _make_agent(
             if reasoning_config_override is not None
             else _load_reasoning_config(str(model or ""))
         ),
+        reasoning_config_is_runtime_override=reasoning_config_override is not None,
         service_tier=(
             service_tier_override
             if service_tier_override is not None
@@ -10477,6 +10488,15 @@ def _(rid, params: dict) -> dict:
                 session["create_reasoning_override"] = parsed
             if session and session.get("agent") is not None:
                 session["agent"].reasoning_config = parsed
+                session["agent"]._reasoning_config_is_runtime_override = not global_scope
+                primary_runtime = getattr(
+                    session["agent"], "_primary_runtime", None
+                )
+                if isinstance(primary_runtime, dict):
+                    primary_runtime["reasoning_config"] = dict(parsed)
+                    primary_runtime["reasoning_config_is_runtime_override"] = (
+                        not global_scope
+                    )
                 _persist_live_session_runtime(session)
                 _emit(
                     "session.info",
