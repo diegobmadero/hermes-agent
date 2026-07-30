@@ -2132,6 +2132,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
         ("reasoning_effort", {"level": "high"}),
+        # Empty slug short-circuits before model resolution, keeping this
+        # case hermetic while still exercising both dispatch paths.
+        ("model_switch", {"slug": "", "reason": ""}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)

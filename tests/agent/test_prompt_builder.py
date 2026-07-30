@@ -68,6 +68,23 @@ class TestGuidanceConstants:
         assert "{" not in REASONING_EFFORT_GUIDANCE
         assert "%s" not in REASONING_EFFORT_GUIDANCE
 
+    def test_model_switch_guidance_teaches_cost_and_scopes(self):
+        from agent.prompt_builder import MODEL_SWITCH_GUIDANCE
+
+        assert "model_switch tool" in MODEL_SWITCH_GUIDANCE
+        assert "prompt cache" in MODEL_SWITCH_GUIDANCE
+        assert "scope='turn'" in MODEL_SWITCH_GUIDANCE
+        assert "never" in MODEL_SWITCH_GUIDANCE.lower()
+
+    def test_model_switch_guidance_is_static_no_model_placeholder(self):
+        # Static text only: rendering the current model here would churn the
+        # prompt on every switch for no benefit (the tool result already
+        # tells the model its new backend).
+        from agent.prompt_builder import MODEL_SWITCH_GUIDANCE
+
+        assert "{" not in MODEL_SWITCH_GUIDANCE
+        assert "%s" not in MODEL_SWITCH_GUIDANCE
+
 
 # =========================================================================
 # Context injection scanning

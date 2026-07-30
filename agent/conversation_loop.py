@@ -1142,6 +1142,15 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
+    # Turn boundary for the model_switch tool: revert a pending turn-scoped
+    # switch and reset the per-turn switch budget. Best-effort — a failure
+    # here must never block the turn.
+    try:
+        from tools.model_switch_tool import reset_turn_model_switch_state
+        reset_turn_model_switch_state(agent)
+    except Exception:
+        pass
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

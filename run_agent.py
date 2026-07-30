@@ -467,6 +467,7 @@ class AIAgent:
         clarify_callback: callable = None,
         read_terminal_callback: callable = None,
         reasoning_update_callback: callable = None,
+        model_update_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -552,6 +553,7 @@ class AIAgent:
             clarify_callback=clarify_callback,
             read_terminal_callback=read_terminal_callback,
             reasoning_update_callback=reasoning_update_callback,
+            model_update_callback=model_update_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -6976,6 +6978,221 @@ class AIAgent:
             level=function_args.get("level", ""),
             persist=function_args.get("persist", False),
             callback=_callback,
+        )
+
+    def _apply_model_switch(self, function_args: dict) -> str:
+        """Apply an agent-requested model switch to the live agent.
+
+        Resolves the target through the shared ``/model`` pipeline
+        (:func:`hermes_cli.model_switch.switch_model`, resolution only) and
+        applies it with :meth:`switch_model` — the same in-place swap
+        ``/model`` uses, including its atomic rollback on client-rebuild
+        failure and its system-prompt rebuild (model-family guidance must
+        match the active model; the provider cache namespace changes with
+        the model anyway, so there is no byte-stable-prompt invariant to
+        preserve across a model switch, unlike reasoning_effort).
+
+        ``model_update_callback(old_model, override, scope)`` lets the
+        platform record the switch durably: the gateway stores it as the
+        session model override — without that, the gateway's post-run
+        fallback detection sees an unexplained model change and evicts the
+        cached agent, silently reverting the switch on the next message.
+        Never persists anything to config.yaml; ``/model --global`` remains
+        the only path to a durable default.
+        """
+        from tools.model_switch_tool import (
+            MAX_SWITCHES_PER_TURN,
+            TURN_REVERT_ATTR,
+            TURN_SWITCH_COUNT_ATTR,
+            model_switch_allowlist,
+        )
+        from tools.registry import tool_error
+
+        slug = str(function_args.get("slug", "") or "").strip()
+        reason = str(function_args.get("reason", "") or "").strip()
+        scope = str(function_args.get("scope", "session") or "session").strip().lower()
+        if not slug:
+            return tool_error("slug is required")
+        if scope not in ("session", "turn"):
+            return tool_error(
+                f"invalid scope '{scope}'", valid_scopes=["session", "turn"]
+            )
+
+        switches_used = getattr(self, TURN_SWITCH_COUNT_ATTR, 0) or 0
+        if switches_used >= MAX_SWITCHES_PER_TURN:
+            return tool_error(
+                f"model switch budget for this turn is exhausted "
+                f"({MAX_SWITCHES_PER_TURN} per turn). Continue on the current "
+                f"model; the budget resets next turn."
+            )
+
+        old_model = getattr(self, "model", "") or ""
+        old_provider = getattr(self, "provider", "") or ""
+        old_base_url = getattr(self, "base_url", "") or ""
+        old_api_key = getattr(self, "api_key", "") or ""
+        old_api_mode = getattr(self, "api_mode", "") or ""
+
+        try:
+            from hermes_cli.config import load_config
+
+            _cfg = load_config() or {}
+        except Exception:
+            _cfg = {}
+        user_providers = _cfg.get("providers")
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+
+            custom_providers = get_compatible_custom_providers(_cfg)
+        except Exception:
+            custom_providers = _cfg.get("custom_providers")
+
+        # Resolution only — no runtime mutation, no persistence
+        # (is_global=False) — so validation failures below leave the agent
+        # untouched.
+        try:
+            from hermes_cli.model_switch import switch_model as _resolve_switch
+
+            result = _resolve_switch(
+                raw_input=slug,
+                current_provider=old_provider,
+                current_model=old_model,
+                current_base_url=old_base_url,
+                current_api_key=old_api_key,
+                is_global=False,
+                explicit_provider="",
+                user_providers=user_providers,
+                custom_providers=custom_providers,
+            )
+        except Exception as exc:
+            return tool_error(f"could not resolve model '{slug}': {exc}")
+        if not getattr(result, "success", False):
+            return tool_error(
+                f"could not switch to '{slug}': "
+                f"{getattr(result, 'error_message', 'unknown model')}"
+            )
+
+        new_model = result.new_model
+        new_provider = result.target_provider
+        if new_model == old_model and new_provider == old_provider:
+            return json.dumps(
+                {
+                    "success": True,
+                    "no_change": True,
+                    "model": old_model,
+                    "provider": old_provider,
+                    "message": f"Already on {old_model} ({old_provider}).",
+                },
+                ensure_ascii=False,
+            )
+
+        allow = model_switch_allowlist(_cfg)
+        if allow is not None:
+            if slug.lower() not in allow and str(new_model).lower() not in allow:
+                return tool_error(
+                    f"model '{new_model}' is not in agent.model_switch_allowlist",
+                    allowlist=allow,
+                )
+        else:
+            # No allowlist: refuse expensive targets. /model gates these
+            # behind an interactive confirmation; the agent has no user to
+            # confirm with, so expensive self-switching requires an explicit
+            # operator allowlist entry.
+            try:
+                from hermes_cli.model_cost_guard import expensive_model_warning
+
+                warning = expensive_model_warning(
+                    new_model,
+                    provider=new_provider,
+                    base_url=result.base_url or old_base_url,
+                    api_key=result.api_key or old_api_key,
+                    model_info=getattr(result, "model_info", None),
+                )
+            except Exception:
+                warning = None
+            if warning is not None:
+                return tool_error(
+                    f"'{new_model}' is cost-guarded and not allowlisted for "
+                    f"self-switching. Ask the user to run /model themselves "
+                    f"or to add it to agent.model_switch_allowlist.",
+                )
+
+        # Snapshot BEFORE mutation for turn scope. A second turn-scoped
+        # switch in the same turn keeps the ORIGINAL snapshot so the revert
+        # lands on the turn's starting runtime, not an intermediate hop.
+        created_snapshot = False
+        if scope == "turn":
+            if getattr(self, TURN_REVERT_ATTR, None) is None:
+                setattr(
+                    self,
+                    TURN_REVERT_ATTR,
+                    {
+                        "model": old_model,
+                        "provider": old_provider,
+                        "base_url": old_base_url,
+                        "api_key": old_api_key,
+                        "api_mode": old_api_mode,
+                    },
+                )
+                created_snapshot = True
+        else:
+            # A session switch supersedes any pending turn revert.
+            if getattr(self, TURN_REVERT_ATTR, None) is not None:
+                setattr(self, TURN_REVERT_ATTR, None)
+
+        try:
+            self.switch_model(
+                new_model=new_model,
+                new_provider=new_provider,
+                api_key=result.api_key,
+                base_url=result.base_url,
+                api_mode=result.api_mode,
+            )
+        except Exception as exc:
+            # switch_model rolled the agent back atomically; drop the
+            # snapshot we created so no stale revert fires next turn.
+            if created_snapshot:
+                setattr(self, TURN_REVERT_ATTR, None)
+            return tool_error(f"model switch to '{new_model}' failed: {exc}")
+
+        setattr(self, TURN_SWITCH_COUNT_ATTR, switches_used + 1)
+        logger.info(
+            "model_switch: %s -> %s (provider=%s, scope=%s, reason=%s)",
+            old_model, new_model, new_provider, scope, reason or "-",
+        )
+
+        if scope == "session" and self.model_update_callback:
+            try:
+                self.model_update_callback(
+                    old_model,
+                    {
+                        "model": new_model,
+                        "provider": new_provider,
+                        "api_key": result.api_key,
+                        "base_url": result.base_url,
+                        "api_mode": result.api_mode,
+                    },
+                    scope,
+                )
+            except Exception as cb_err:
+                logger.warning("model_update_callback failed: %s", cb_err)
+
+        message = (
+            f"Model switched from {old_model} to {new_model} ({new_provider}) "
+            f"for {'the rest of this turn' if scope == 'turn' else 'this session'}. "
+            f"Applies from your next model request; the provider prompt cache "
+            f"starts cold on the new model."
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "old_model": old_model,
+                "new_model": new_model,
+                "provider": new_provider,
+                "scope": scope,
+                "switches_remaining_this_turn": MAX_SWITCHES_PER_TURN - switches_used - 1,
+                "message": message,
+            },
+            ensure_ascii=False,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

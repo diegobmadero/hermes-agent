@@ -220,6 +220,21 @@ REASONING_EFFORT_GUIDANCE = (
     "for a permanent default."
 )
 
+# NOTE: deliberately static text — never render the CURRENT model here (the
+# model learns the active backend from the model_switch tool result). The
+# guidance stays constant so enabling the tool adds one stable block, not a
+# per-switch prompt churn.
+MODEL_SWITCH_GUIDANCE = (
+    "You can switch your own model with the model_switch tool when the "
+    "current one is clearly mismatched to the task: escalate for genuinely "
+    "hard reasoning or coding, downshift for long runs of routine turns. "
+    "Switching discards the provider prompt cache and adds latency/cost "
+    "overhead, so do it sparingly — never to ping-pong between models. "
+    "scope='turn' auto-reverts before the next turn; scope='session' lasts "
+    "until the session resets. Nothing you switch is ever persisted as the "
+    "user's default; their /model choice always wins."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

@@ -450,6 +450,15 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             level += " (persist)"
         return level
 
+    # model_switch: show the target slug (+ turn-scope marker)
+    if tool_name == "model_switch":
+        slug = _oneline(str(args.get("slug", "")).strip())
+        if not slug:
+            return None
+        if str(args.get("scope", "")).strip().lower() == "turn":
+            slug += " (turn)"
+        return slug
+
     # delegate_task: show goal (single) or individual task goals (batch)
     if tool_name == "delegate_task":
         tasks = args.get("tasks")
@@ -603,6 +612,7 @@ _TOOL_VERBS: dict[str, str] = {
     "memory": "Updating memory",
     "todo": "Updating tasks",
     "reasoning_effort": "Adjusting reasoning effort",
+    "model_switch": "Switching model",
 }
 
 # Verbs that read better without the raw argument preview appended.

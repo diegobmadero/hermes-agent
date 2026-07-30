@@ -39,6 +39,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
+    MODEL_SWITCH_GUIDANCE,
     REASONING_EFFORT_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
@@ -236,6 +237,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # prompt stays byte-stable when the tool changes reasoning_config.
     if "reasoning_effort" in agent.valid_tool_names:
         tool_guidance.append(REASONING_EFFORT_GUIDANCE)
+    # Static text only — the current model is NOT rendered here. (A model
+    # switch itself rebuilds the prompt via switch_model, same as /model;
+    # this block just never adds churn of its own.)
+    if "model_switch" in agent.valid_tool_names:
+        tool_guidance.append(MODEL_SWITCH_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

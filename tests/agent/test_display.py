@@ -54,6 +54,18 @@ class TestBuildToolPreview:
     def test_reasoning_effort_preview_empty_level_returns_none(self):
         assert build_tool_preview("reasoning_effort", {"level": ""}) is None
 
+    def test_model_switch_preview_shows_slug(self):
+        assert build_tool_preview("model_switch", {"slug": "gpt-5.5"}) == "gpt-5.5"
+
+    def test_model_switch_preview_marks_turn_scope(self):
+        result = build_tool_preview(
+            "model_switch", {"slug": "gpt-5.5", "scope": "turn"}
+        )
+        assert result == "gpt-5.5 (turn)"
+
+    def test_model_switch_preview_empty_slug_returns_none(self):
+        assert build_tool_preview("model_switch", {"slug": " "}) is None
+
     def test_none_args_returns_none(self):
         """PR #453: None args should not crash, should return None."""
         assert build_tool_preview("terminal", None) is None
