@@ -211,19 +211,6 @@ delegation:
 
 A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
 
-You can also set the cap on an individual `delegate_task` call with `timeout_seconds`, or on an individual task inside a batch. Precedence is **per-task `timeout_seconds` > top-level `timeout_seconds` > `delegation.child_timeout_seconds`**. Omit the field to inherit the next level. Set `timeout_seconds: 0` to disable the hard cap for that call or task, even when config has a positive cap. Positive values below 30 seconds are floored to 30 seconds. Invocation overrides must be finite, non-negative numbers; booleans, strings, and other values are rejected before any child starts.
-
-```python
-delegate_task(goal="Deep review", timeout_seconds=1800)
-delegate_task(
-    tasks=[
-        {"goal": "Quick lint", "timeout_seconds": 120},
-        {"goal": "Long research", "timeout_seconds": 0},
-    ],
-    timeout_seconds=600,
-)
-```
-
 When a configured cap fires, the child's result carries structured timeout
 metadata alongside the error message so parents and hooks can distinguish a
 stopwatch kill from other failures without parsing text: `timeout_seconds`

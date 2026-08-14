@@ -21,7 +21,6 @@ import enum
 import contextvars
 import json
 import logging
-import math
 import re
 
 logger = logging.getLogger(__name__)
@@ -857,31 +856,6 @@ def _get_child_timeout() -> Optional[float]:
         else:
             return None if parsed <= 0 else max(30.0, parsed)
     return DEFAULT_CHILD_TIMEOUT
-
-
-_CHILD_TIMEOUT_UNSET = object()
-
-
-def _parse_child_timeout_override(
-    value: Any, field_name: str = "timeout_seconds"
-) -> tuple[object, Optional[str]]:
-    """Parse a per-call child timeout override.
-
-    Returns ``_CHILD_TIMEOUT_UNSET`` when the caller omitted the override so the
-    global ``delegation.child_timeout_seconds`` value should still apply.
-    """
-    if value is _CHILD_TIMEOUT_UNSET:
-        return _CHILD_TIMEOUT_UNSET, None
-    if value is None:
-        return _CHILD_TIMEOUT_UNSET, None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return _CHILD_TIMEOUT_UNSET, f"{field_name} must be a number of seconds."
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        return _CHILD_TIMEOUT_UNSET, f"{field_name} must be finite."
-    if parsed < 0:
-        return _CHILD_TIMEOUT_UNSET, f"{field_name} must not be negative."
-    return (None if parsed == 0 else max(30.0, parsed)), None
 
 
 def _get_max_spawn_depth() -> int:
@@ -2290,7 +2264,6 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
-    timeout_seconds: object = _CHILD_TIMEOUT_UNSET,
     *,
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
@@ -2573,11 +2546,7 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = (
-            _get_child_timeout()
-            if timeout_seconds is _CHILD_TIMEOUT_UNSET
-            else timeout_seconds
-        )
+        child_timeout = _get_child_timeout()
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -3419,7 +3388,6 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
-    timeout_seconds: Optional[float] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3514,12 +3482,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    top_timeout_override, timeout_error = _parse_child_timeout_override(
-        timeout_seconds, "timeout_seconds"
-    )
-    if timeout_error:
-        return tool_error(timeout_error)
-
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
@@ -3574,28 +3536,6 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
-
-    configured_child_timeout = _get_child_timeout()
-    top_effective_timeout = (
-        configured_child_timeout
-        if top_timeout_override is _CHILD_TIMEOUT_UNSET
-        else top_timeout_override
-    )
-    task_timeouts = []
-    for i, task in enumerate(task_list):
-        if "timeout_seconds" in task:
-            task_timeout_override, timeout_error = _parse_child_timeout_override(
-                task.get("timeout_seconds"), f"tasks[{i}].timeout_seconds"
-            )
-            if timeout_error:
-                return tool_error(timeout_error)
-        else:
-            task_timeout_override = _CHILD_TIMEOUT_UNSET
-        task_timeouts.append(
-            top_effective_timeout
-            if task_timeout_override is _CHILD_TIMEOUT_UNSET
-            else task_timeout_override
-        )
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3674,9 +3614,6 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
-        # Per-task timeout resolved during validation above; threads through
-        # the children tuples so batch and single paths enforce the same cap.
-        task_timeout = task_timeouts[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3727,7 +3664,7 @@ def delegate_task(
                 getattr(child, "tool_progress_callback", None), _writer
             )
             child._live_transcript_path = str(_writer.path)
-        children.append((i, t, child, task_timeout))
+        children.append((i, t, child))
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3741,13 +3678,12 @@ def delegate_task(
         """
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
-            _i, _t, child, child_timeout = children[0]
+            _i, _t, child = children[0]
             result = _run_single_child(
                 _i,
                 _t["goal"],
                 child,
                 parent_agent,
-                timeout_seconds=child_timeout,
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
@@ -3764,7 +3700,7 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child, child_timeout in children:
+                for i, t, child in children:
                     child_context = contextvars.copy_context()
                     future = executor.submit(
                         child_context.run,
@@ -3773,7 +3709,6 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
-                        timeout_seconds=child_timeout,
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
@@ -3787,7 +3722,7 @@ def delegate_task(
                 # when the parent is interrupted.
                 # Map task_index -> child agent, so fabricated entries for
                 # still-pending futures can carry the correct _delegate_role.
-                _child_by_index = {i: child for (i, _, child, _) in children}
+                _child_by_index = {i: child for (i, _, child) in children}
 
                 pending = set(futures.keys())
                 while pending:
@@ -4021,7 +3956,7 @@ def delegate_task(
             if _agent_session_id:
                 _session_key = _agent_session_id
         _parent_session_id = getattr(parent_agent, "session_id", None)
-        _child_agents = [c for (_, _, c, _) in children]
+        _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -4591,17 +4526,6 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
-            "timeout_seconds": {
-                "type": "number",
-                "description": (
-                    "Optional per-call wall-clock cap for each child agent. "
-                    "Precedence is per-task timeout_seconds, then this "
-                    "top-level timeout_seconds, then "
-                    "delegation.child_timeout_seconds. Omit to use config; "
-                    "set 0 to disable the hard cap for this call. Positive "
-                    "values below 30 are floored to 30 seconds."
-                ),
-            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4616,18 +4540,6 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
-                        },
-                        "timeout_seconds": {
-                            "type": "number",
-                            "description": (
-                                "Per-task wall-clock cap override for this "
-                                "child. Overrides the top-level "
-                                "timeout_seconds and "
-                                "delegation.child_timeout_seconds. Omit to "
-                                "inherit; set 0 to disable the hard cap for "
-                                "this child. Positive values below 30 are "
-                                "floored to 30 seconds."
-                            ),
                         },
                         "output_schema": {
                             "type": "object",
@@ -4766,7 +4678,6 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
-        timeout_seconds=args.get("timeout_seconds"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),
