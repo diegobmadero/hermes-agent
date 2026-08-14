@@ -1842,7 +1842,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "reasoning_effort":
             def _execute(next_args: dict) -> Any:
                 return agent._apply_reasoning_effort(next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1858,7 +1858,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "model_switch":
             def _execute(next_args: dict) -> Any:
                 return agent._apply_model_switch(next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
