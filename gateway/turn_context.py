@@ -84,6 +84,8 @@ class TurnContext:
     session_id: Optional[str] = None
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
+    process_task_id: str = ""
+    process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0
     event_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
@@ -127,3 +129,12 @@ class TurnContext:
     _step_callback_sync: Optional[Callable] = None
     _event_callback_sync: Optional[Callable] = None
     _status_callback_sync: Optional[Callable] = None
+
+    # --- Slack-native task-card progress (opt-in; #29483) ------------------
+    # True when the Slack adapter's ``native_task_cards_enabled()`` opt-in is
+    # set for this turn's platform. The ID-bearing lifecycle callbacks are
+    # published by TurnRunner (like voice_ack_callback above) so tool starts
+    # and completions correlate by real tool-call ID instead of tool name.
+    _native_slack_task_cards: bool = False
+    native_tool_start_callback: Optional[Callable] = None
+    native_tool_complete_callback: Optional[Callable] = None

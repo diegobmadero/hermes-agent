@@ -117,6 +117,7 @@ export const ar = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'يتطلب ElevenLabs STT المفتاح ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'رفض ElevenLabs مفتاح API (401).',
+      diskFull: 'القرص ممتلئ — حرّر مساحة ثم أعد المحاولة.',
       methodNotAllowed: 'رفضت خلفية سطح المكتب هذا الطلب (405 Method Not Allowed). جرب إعادة تشغيل Hermes Desktop.',
       microphonePermission: 'تم رفض إذن الميكروفون.',
       openaiRejectedApiKey: 'رفض OpenAI مفتاح API.',
@@ -171,7 +172,8 @@ export const ar = defineLocale({
     unmuteHaptics: 'تفعيل الاهتزازات',
     openSettings: 'فتح الإعدادات',
     openStarmap: 'فتح خريطة الذاكرة',
-    openKeybinds: 'اختصارات لوحة المفاتيح',
+    enterHud: 'وضع HUD',
+    exitHud: 'إنهاء وضع HUD',
     layoutEditor: 'محرر التخطيط',
     layoutEditorTitle: 'محرر التخطيط — انقر مع ⌘ لإعادة ضبط التخطيط'
   },
@@ -220,6 +222,7 @@ export const ar = defineLocale({
       'session.focusSearch': 'البحث في الجلسات',
       'session.togglePin': 'تثبيت / إلغاء تثبيت الجلسة الحالية',
       'workspace.newWorktree': 'worktree جديد',
+      'workspace.openFolder': 'فتح مجلد كمشروع',
       'composer.focus': 'التركيز على المحرّر',
       'composer.modelPicker': 'فتح منتقي النموذج',
       'composer.voice': 'بدء / إيقاف المحادثة الصوتية',
@@ -911,7 +914,7 @@ export const ar = defineLocale({
     needsKeys: 'يحتاج مفاتيح',
     toolsetsEnabled: (enabled, total) => `${enabled} من ${total} مفعلة`,
     configureToolset: label => `ضبط ${label}`,
-    toggleToolset: label => `تبديل ${label}`,
+    toggleToolset: (label, enabled) => `${enabled ? 'تشغيل' : 'إيقاف'} ${label}`,
     skillsLoadFailed: 'فشل تحميل المهارات',
     toolsetsRefreshFailed: 'فشل تحديث مجموعات الأدوات',
     skillEnabled: 'تم تفعيل المهارة',
@@ -976,7 +979,7 @@ export const ar = defineLocale({
       installed: 'مثبّت',
       generatedTag: 'مُولّد',
       adoptFailed: 'تعذّر تبنّي ذلك الحيوان الأليف.',
-      toggleFailed: 'تعذّر تبديل الحيوان الأليف.',
+      toggleFailed: enabled => `تعذّر ${enabled ? 'تشغيل' : 'إيقاف'} الحيوان الأليف.`,
       noneAvailable: 'لا توجد حيوانات أليفة متاحة — اختر واحدا أدناه لتثبيته.'
     },
     generatePet: {
@@ -1291,6 +1294,12 @@ export const ar = defineLocale({
     count: count => `${count} ملف شخصي`,
     loading: 'جار التحميل...',
     newProfile: 'ملف شخصي جديد',
+    importProfile: 'استيراد ملف شخصي…',
+    exportProfile: 'تصدير ملف شخصي…',
+    imported: 'تم استيراد الملف الشخصي',
+    exported: 'تم تصدير الملف الشخصي',
+    failedImport: 'فشل استيراد الملف الشخصي',
+    failedExport: 'فشل تصدير الملف الشخصي',
     allProfiles: 'كل الملفات الشخصية',
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,
@@ -1361,6 +1370,13 @@ export const ar = defineLocale({
   },
   cron: {
     close: 'إغلاق',
+    modelImpact: {
+      title: 'تحتاج المهام المجدولة إلى المراجعة',
+      message: count => `سيتم تخطي ${count} من المهام المجدولة حتى تراجع إعدادات النموذج الخاصة بها.`,
+      detailMore: (names, remaining) => `${names} و${remaining} أخرى`,
+      review: 'مراجعة المهام المجدولة',
+      saveFailed: 'لم يحفظ Hermes تغيير النموذج هذا.'
+    },
     search: 'بحث',
     loading: 'جار التحميل...',
     states: {
@@ -1551,6 +1567,7 @@ export const ar = defineLocale({
     noWorkspace: 'بدون مساحة عمل',
     projectEmpty: 'لا توجد جلسات بعد',
     noSessions: 'لا توجد جلسات بعد',
+    noFilterMatches: 'لا توجد جلسات تطابق عوامل التصفية هذه',
     projects: {
       sectionLabel: 'المشاريع',
       home: 'الرئيسية',
@@ -1588,6 +1605,9 @@ export const ar = defineLocale({
       newWorktreeDesc: 'سمِّ الفرع لشجرة العمل هذه.',
       branchPlaceholder: 'مثال: my-feature',
       startWorkFailed: 'تعذّر إنشاء شجرة العمل',
+      worktreeProjectLabel: 'المشروع',
+      worktreeProjectPlaceholder: 'ابحث في المشاريع…',
+      worktreeProjectNone: 'لا توجد مشاريع بمجلد',
       convertBranch: 'تحويل فرع...',
       convertBranchTitle: 'تحويل فرع',
       convertBranchDesc: 'افتح الفروع المسحوبة، أو أنشئ شجرة عمل لفرع حر.',
@@ -1596,6 +1616,7 @@ export const ar = defineLocale({
       branchOpenExisting: 'فتح',
       branchSwitchHome: 'تبديل الموطن',
       branchCreateWorktree: 'شجرة عمل جديدة',
+      branchTrackRemote: 'تتبع البعيد',
       branchesLoading: 'جار تحميل الفروع...',
       noBranches: 'لم يتم العثور على فروع',
       removeWorktree: 'إزالة شجرة العمل',
@@ -1607,7 +1628,7 @@ export const ar = defineLocale({
       forceRemove: 'إزالة بالقوة',
       enter: label => `فتح ${label}`,
       reorder: label => `إعادة ترتيب ${label}`,
-      toggle: label => `تبديل جلسات ${label}`,
+      toggle: (label, open) => `${open ? 'إظهار' : 'إخفاء'} جلسات ${label}`,
       back: 'كل المشاريع'
     },
     newSessionIn: label => `جلسة جديدة في ${label}`,
@@ -1631,6 +1652,7 @@ export const ar = defineLocale({
       needsInput: 'تحتاج إدخالا',
       waitingForAnswer: 'بانتظار إجابة',
       backgroundRunning: 'تعمل في الخلفية',
+      draftSession: 'مسودة — لم تُرسل بعد',
       finishedUnread: 'اكتملت وفيها جديد',
       hideTabBar: 'إخفاء شريط التبويبات',
       openInNewTab: 'فتح في تبويب جديد',
@@ -1658,6 +1680,7 @@ export const ar = defineLocale({
     newSessionPlaceholders: ['اسأل Hermes عن شيء...', 'اطلب من Hermes تنفيذ مهمة...', 'ابدأ محادثة جديدة...'],
     followUpPlaceholders: ['اكتب متابعة...', 'أضف توجيها...', 'اسأل سؤالا آخر...'],
     startVoice: 'بدء الصوت',
+    openDirective: 'فتح',
     queueMessage: 'إضافة الرسالة للطابور',
     steer: 'توجيه',
     stop: 'إيقاف',
@@ -1714,6 +1737,7 @@ export const ar = defineLocale({
     editingQueuedInComposer: 'جار تحرير رسالة في الطابور',
     queueEdit: 'تحرير الرسالة المجدولة',
     queueSendNext: 'إرسالها تاليا',
+    queueSteer: 'توجيه — تصحيح الدور الجاري فورا',
     queueSend: 'إرسالها الآن',
     queueDelete: 'حذف من الطابور',
     queueStuckTitle: 'لم تُرسل الرسالة في قائمة الانتظار',
@@ -2134,10 +2158,6 @@ export const ar = defineLocale({
   },
   preview: {
     tab: 'معاينة',
-    closeTab: label => `إغلاق ${label}`,
-    closeOthers: 'إغلاق الأخرى',
-    closeToRight: 'إغلاق ما على اليمين',
-    closeAll: 'إغلاق الكل',
     closePane: 'إغلاق جزء المعاينة',
     loading: 'جار تحميل المعاينة',
     unavailable: 'المعاينة غير متاحة',
@@ -2233,20 +2253,15 @@ export const ar = defineLocale({
     closeRunningBody:
       'هذه المحادثة ما زالت تعمل (أو تنتظر إدخالك). إغلاق التبويب يخفيها فقط — ستحتفظ الجلسة بتقدمها ويمكن إعادة فتحها من الشريط الجانبي.',
     closeRunningConfirm: 'إغلاق التبويب',
+    reload: 'إعادة التحميل',
     closeOthers: 'إغلاق الأخرى',
     closeToRight: 'إغلاق ما على اليمين',
     closeAll: 'إغلاق الكل',
-    split: dir => `تقسيم ${dir}`,
-    move: dir => `نقل ${dir}`,
-    dirUp: 'للأعلى',
-    dirDown: 'للأسفل',
-    dirLeft: 'لليسار',
-    dirRight: 'لليمين',
     pluginDisabled: pluginId => `الإضافة "${pluginId}" معطلة`,
     pluginDisabledBody: 'أعد تفعيلها من الإعدادات ← الإضافات لإرجاع اللوحة.',
     missingPane: paneId => `لوحة مفقودة: ${paneId}`,
     editTitle: 'التخطيطات',
-    editHint: 'اختر تخطيطا، أو اسحب اللوحات بين المناطق. انقر بزر الفأرة الأيمن على منطقة لتقسيمها.',
+    editHint: 'اختر تخطيطا، أو اسحب اللوحات بين المناطق.',
     reset: 'إعادة ضبط',
     templates: 'القوالب',
     custom: 'مخصص',
@@ -2267,7 +2282,8 @@ export const ar = defineLocale({
     layoutNamePlaceholder: fallback => `اسم التخطيط (${fallback})`,
     saveApply: 'حفظ وتطبيق',
     notExpressible: 'هذا الترتيب متشابك — لا يمكن تمثيله كتقسيمات متداخلة بعد',
-    zoneCount: count => `${count} مناطق`
+    zoneCount: count => `${count} مناطق`,
+    tabCount: count => `${count} تبويبات`
   },
   assistant: {
     thread: {
@@ -2288,6 +2304,8 @@ export const ar = defineLocale({
       branchNewChat: 'تفريع إلى محادثة جديدة',
       react: 'تفاعل',
       dismissError: 'تجاهل الخطأ',
+      filesChanged: count => `${count} ملفات تم تغييرها`,
+      reviewChanges: 'مراجعة',
       readAloudFailed: 'فشلت القراءة بصوت عال',
       preparingAudio: 'جار تجهيز الصوت',
       stopReading: 'إيقاف القراءة',
@@ -2598,7 +2616,7 @@ export const ar = defineLocale({
     sidebar: {
       title: 'الشريط الجانبي',
       description: 'تنقل التطبيق',
-      toggle: 'تبديل الشريط الجانبي'
+      toggle: open => `${open ? 'إظهار' : 'إخفاء'} الشريط الجانبي`
     }
   }
 })

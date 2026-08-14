@@ -88,6 +88,11 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   { id: 'session.togglePin', category: 'session', defaults: [] },
   // ⌘⇧B — "b" for branch: spin up a new git worktree from the active repo.
   { id: 'workspace.newWorktree', category: 'session', defaults: ['mod+shift+b'] },
+  // ⌘O — the editor-standard "open folder" chord (VS Code ⌘O, Zed's
+  // workspace::Open). Picks a folder and opens it as a project (upsert:
+  // enters the owning project when one exists, else creates one), landing on
+  // a fresh session anchored there.
+  { id: 'workspace.openFolder', category: 'session', defaults: ['mod+o'] },
 
   // ── Navigation ───────────────────────────────────────────────────────────
   { id: 'nav.commandPalette', category: 'navigation', defaults: ['mod+k', 'mod+p'] },
@@ -111,6 +116,11 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   // ⌘G — "g" for git; the review pane is the source-control view.
   { id: 'view.toggleReview', category: 'view', defaults: ['mod+g'] },
   { id: 'view.showFiles', category: 'view', defaults: [] },
+  // ⌘⇧H — "h" for HUD. Enters/leaves the chrome-free floating chat: the app
+  // window steps aside and a composer + live reply float over whatever the
+  // user is working in. Ships bound because the whole point is leaving the app
+  // without reaching for it — but the titlebar button is the discoverable door.
+  { id: 'view.toggleHud', category: 'view', defaults: ['mod+shift+h'] },
   // Control+` everywhere (literal `ctrl`, NOT `mod`): ⌘` is macOS-reserved for
   // cycling app windows, so VS Code/Cursor/Zed bind the terminal to Ctrl+` on
   // every platform. Off macOS `ctrl` folds to `mod` (= Ctrl), so it's unchanged.
@@ -234,5 +244,7 @@ export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
   // Code. Plain Ctrl+C also copies when text is selected (Windows Terminal /
   // Tabby behavior); with no selection it stays SIGINT, so it isn't listed.
   { id: 'view.terminalCopy', category: 'view', keys: IS_MAC ? ['mod+c'] : ['mod+shift+c'] },
-  { id: 'view.terminalPaste', category: 'view', keys: IS_MAC ? ['mod+v'] : ['mod+shift+v'] }
+  { id: 'view.terminalPaste', category: 'view', keys: IS_MAC ? ['mod+v'] : ['mod+shift+v'] },
+  // Global OS chord registered in main while HUD mode is up.
+  { id: 'hud.snapToPointer', category: 'view', keys: ['mod+shift+g'] }
 ]

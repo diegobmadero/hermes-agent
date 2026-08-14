@@ -1,28 +1,27 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
-import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
+import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
-import type { ChatMessage } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { toggleMessageReaction } from '@/store/reactions'
-import { $reactionsEnabled } from '@/store/reactions-enabled'
-import { $agentReactions, $localReactions, mergeReactions, setLocalReaction } from '@/store/reactions-local'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
-import type { MessageReaction } from '@/types/hermes'
 
-// Stable empty identity — a fresh [] per render would re-run every consumer.
-const EMPTY_REACTIONS: MessageReaction[] = []
+/** True when the user has a live text highlight (drag-select / triple-click). */
+export function hasTextSelection(): boolean {
+  const selection = window.getSelection()
+
+  return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
+}
 
 export function StickyHumanMessageContainer({
   attachments,
@@ -154,38 +153,15 @@ export const UserMessage: FC<{
     return messageAttachmentRefs(custom.attachmentRefs)
   })
 
-  const reactions = useAuiState(s => {
-    const custom = (s.message.metadata?.custom ?? {}) as { reactions?: MessageReaction[] }
-
-    return custom.reactions ?? EMPTY_REACTIONS
-  })
-
-  const rowId = useAuiState(s => {
-    const custom = (s.message.metadata?.custom ?? {}) as { rowId?: number }
-
-    return custom.rowId
-  })
-
   const [pickerOpen, setPickerOpen] = useState(false)
-  const reactionsEnabled = useStore($reactionsEnabled)
-  const localAll = useStore($localReactions)
-  const agentLive = useStore($agentReactions)
+  const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'user')
 
-  const shownReactions = mergeReactions(
-    reactions,
-    localAll[messageId],
-    rowId !== undefined ? agentLive[rowId] : undefined
-  )
-
-  const react = useCallback(
+  const pickEmoji = useCallback(
     (emoji: null | string) => {
       setPickerOpen(false)
-      // Flip the UI immediately — a tapback is direct manipulation and must
-      // never wait on a round-trip. Persistence follows in the background.
-      setLocalReaction(messageId, emoji)
-      void toggleMessageReaction({ id: messageId, role: 'user', rowId, reactions } as ChatMessage, emoji)
+      react(emoji)
     },
-    [messageId, reactions, rowId]
+    [react]
   )
 
   // Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
@@ -303,17 +279,23 @@ export const UserMessage: FC<{
           <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
             <ReactionPicker
               onOpenChange={setPickerOpen}
-              onSelect={react}
+              onSelect={pickEmoji}
               open={pickerOpen}
               selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
             >
               <div
                 className="relative w-full"
                 onContextMenu={
-                  // Right-click is the desktop stand-in for iOS touch-and-hold.
+                  // Right-click is the desktop stand-in for iOS touch-and-hold —
+                  // but only when there's nothing selected. A live highlight
+                  // keeps the native Copy menu (and ⌘C) instead of the picker.
                   readOnly || !reactionsEnabled
                     ? undefined
                     : event => {
+                        if (hasTextSelection()) {
+                          return
+                        }
+
                         event.preventDefault()
                         setPickerOpen(true)
                       }
@@ -326,7 +308,9 @@ export const UserMessage: FC<{
                     aria-expanded={bodyClamped ? expanded : undefined}
                     className={cn(bubbleClassName, !bodyClamped && 'cursor-default')}
                     onClick={() => {
-                      if (!bodyClamped) {
+                      // Drag-select ends on mouseup→click; don't collapse the
+                      // clamp just because the highlight finished.
+                      if (hasTextSelection() || !bodyClamped) {
                         return
                       }
 
@@ -341,13 +325,29 @@ export const UserMessage: FC<{
                 ) : (
                   // Always editable — clicking opens the edit composer even while a
                   // turn streams; sending the edit reverts (interrupt + rewind).
+                  // A live text highlight wins: finishing a drag-select must not
+                  // open the editor and throw the selection away.
                   <ActionBarPrimitive.Edit asChild>
                     <button
                       aria-label={copy.editMessage}
                       className={bubbleClassName}
-                      onClick={() => triggerHaptic('selection')}
-                      onPointerDown={() => notifyThreadEditOpen()}
-                      title={copy.editMessage}
+                      onClick={event => {
+                        if (hasTextSelection()) {
+                          event.preventDefault()
+                          event.stopPropagation()
+
+                          return
+                        }
+
+                        triggerHaptic('selection')
+                      }}
+                      onPointerDown={() => {
+                        if (hasTextSelection()) {
+                          return
+                        }
+
+                        notifyThreadEditOpen()
+                      }}
                       type="button"
                     >
                       {bubbleContent}

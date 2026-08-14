@@ -3,6 +3,7 @@ import type { HermesSkin } from '@hermes/shared/skin'
 import type { QueryClient } from '@tanstack/react-query'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { readActivePreview } from '@/app/chat/right-rail/preview-reader'
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
@@ -33,8 +34,9 @@ import {
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
+import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
-import { notify } from '@/store/notifications'
+import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
@@ -46,9 +48,11 @@ import {
   $currentCwd,
   $currentModel,
   $currentProvider,
+  $selectedStoredSessionId,
+  $sessions,
   sessionMatchesStoredId,
   setCurrentBranch,
-  setCurrentCwd,
+  setCurrentCwdTransient,
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
@@ -56,10 +60,15 @@ import {
   setCurrentUsage,
   setMessages,
   setSessions,
+  setTerminalBackend,
   setTurnStartedAt,
+  setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import { dropSessionState } from '@/store/session-states'
 import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSubagent } from '@/store/subagents'
+import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
+import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -71,11 +80,48 @@ import { ingestBackendSkin } from '@/themes/backend-sync'
 import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
+import { finalizeInterruptedMessages } from '../use-prompt-actions/rewind'
 
 import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
 
 function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
+}
+
+/**
+ * Whether a `session.info` payload's `stored_session_id` may be treated as the
+ * selected conversation's, so its cwd can be claimed for it (#71254).
+ *
+ * Absent is not the same as different: the backend omits the id on a
+ * not-yet-built (`lazy`) session, and refusing there would leave the workspace
+ * marked un-owned for the rest of the conversation. Matching goes through the
+ * lineage (`sessionMatchesStoredId`) so a compression-rotated tip and the root
+ * a pinned-row selection may hold still read as one conversation.
+ */
+function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined): boolean {
+  const infoStoredSessionId = storedSessionId?.trim() || null
+  const selected = $selectedStoredSessionId.get() ?? null
+
+  if (!infoStoredSessionId) {
+    return true
+  }
+
+  // A named session cannot describe a fresh draft. Treating a null selection as
+  // a wildcard let a background tile's `session.info` rehome the draft to the
+  // tile's workspace.
+  if (!selected) {
+    return false
+  }
+
+  if (infoStoredSessionId === selected) {
+    return true
+  }
+
+  // Either id may be the live tip or the lineage root, so ask whether ONE row
+  // answers to both rather than assuming which side rotated.
+  return $sessions
+    .get()
+    .some(session => sessionMatchesStoredId(session, infoStoredSessionId) && sessionMatchesStoredId(session, selected))
 }
 
 /**
@@ -331,6 +377,23 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         return
+      } else if (event.type === 'session.reclaimed') {
+        // The backend reclaimed a live session we may still be holding (idle
+        // TTL, LRU cap, or the WS-orphan reap). Without this the runtime id
+        // stays cached until something fails against it, which reads as the
+        // session vanishing rather than being reclaimed. Drop the cached state
+        // now — the stored row is untouched, so the sidebar keeps the
+        // conversation and reopening it resumes from the DB.
+        const reclaimedRuntimeId = String((payload as { session_id?: string } | undefined)?.session_id ?? '')
+
+        if (reclaimedRuntimeId) {
+          dropSessionState(reclaimedRuntimeId)
+        }
+
+        // The row's ended_at moved, so refresh the lists that render it.
+        notifySessionsChanged()
+
+        return
       } else if (event.type === 'session.info') {
         // Apply session-scoped fields when the event targets the active
         // session, OR when it's a global broadcast and we have no session.
@@ -376,7 +439,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // Active-session model/provider still flows through the session state
           // cache via updateSessionState → syncRuntimeMetadataToView below.
 
-          if (typeof payload?.cwd === 'string') {
+          if (typeof payload?.cwd === 'string' && sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
             // The active session's agent can relocate itself (new repo/worktree
             // via the terminal). When the SAME active session's cwd actually
             // moves, follow it — refresh the project tree + scope so the sidebar
@@ -386,7 +449,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
 
             lastCwdInfoSessionRef.current = sessionId
-            setCurrentCwd(payload.cwd)
+            setCurrentCwdTransient(payload.cwd)
+
+            // The backend just confirmed the selected conversation's real
+            // workspace, so it owns the path we wrote. Without the claim the
+            // marker keeps naming whoever held it before — including the
+            // released state a detached resume leaves behind — and the primary
+            // workspace-derived surfaces stay hidden against a folder the
+            // backend has confirmed (#71254).
+            setWorkspaceCwdOwner($selectedStoredSessionId.get())
 
             if (cwdMoved && sameSession) {
               void followActiveSessionCwd(payload.cwd)
@@ -395,6 +466,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (typeof payload?.branch === 'string') {
             setCurrentBranch(payload.branch)
+          }
+
+          if (typeof payload?.terminal_backend === 'string') {
+            setTerminalBackend(payload.terminal_backend)
           }
 
           if (typeof payload?.personality === 'string') {
@@ -474,6 +549,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 ...state,
                 awaitingResponse: false,
                 busy,
+                // The turn is over but its streaming bubble may still say
+                // pending — running=false from the agent loop's finally block
+                // is the ONLY settle signal when message.complete never
+                // arrives (turn crash, reconnect gap). Left pending, that
+                // bubble shows a thinking indicator forever, stranded
+                // mid-transcript once the next user message lands after it.
+                // finalizeInterruptedMessages un-pends kept text and drops
+                // empty placeholders; on the normal path message.complete
+                // already settled everything and this is a no-op.
+                messages: finalizeInterruptedMessages(state.messages, state.streamId),
                 pendingBranchGroup: null,
                 streamId: null,
                 turnStartedAt: null
@@ -802,9 +887,23 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         // The agent just created/deleted/renamed a skill, which adds or removes
         // its `/name` command. Drop the composer's cached `/` list so the new
-        // skill is offerable now rather than after the hour-long TTL.
+        // skill is offerable now rather than after the hour-long TTL — and the
+        // skill-suggestion provider's index with it.
         if (payload?.name === 'skill_manage') {
           invalidateSlashCompletions()
+          invalidateSkillSuggestionIndex()
+        }
+
+        // MCP tool outcomes feed the connection-repair suggestion provider:
+        // an auth/connection-shaped failure offers a reconnect pill; a later
+        // success against the same server withdraws it.
+        if (sessionId && typeof payload?.name === 'string' && payload.name.startsWith('mcp__')) {
+          reportMcpToolResult(
+            sessionId,
+            payload.name,
+            Boolean(payload.error),
+            [payload.error, payload.result].filter(part => typeof part === 'string').join(' ')
+          )
         }
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {
@@ -879,6 +978,37 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           dispatchNativeNotification({
             body: question,
+            kind: 'input',
+            sessionId,
+            title: translateNow('notifications.native.inputTitle')
+          })
+        }
+      } else if (event.type === 'mcp.setup.request') {
+        // setup_mcp tool (desktop GUI): the agent proposed an MCP server and
+        // the Python side is blocked on mcp.setup.respond. Park the request
+        // per-session (like clarify) and upsert a stable pending tool row so
+        // the inline consent card has somewhere to render even when the
+        // tool.start event was missed (stream reconnect / hydration race).
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+        const server = typeof payload?.server === 'string' ? payload.server : ''
+        const rawAction = typeof payload?.action === 'string' ? payload.action : 'install'
+        const action = rawAction === 'enable' || rawAction === 'authorize' ? rawAction : 'install'
+        const reason = typeof payload?.reason === 'string' ? payload.reason : ''
+
+        if (requestId && server) {
+          setMcpSetupRequest({ action, reason, requestId, server, sessionId: sessionId ?? null })
+
+          if (sessionId) {
+            upsertToolCall(
+              sessionId,
+              { args: { action, reason, server }, name: 'setup_mcp', tool_id: requestId },
+              'running'
+            )
+            updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+          }
+
+          dispatchNativeNotification({
+            body: reason || server,
             kind: 'input',
             sessionId,
             title: translateNow('notifications.native.inputTitle')
@@ -981,6 +1111,42 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             text: result ? JSON.stringify(result) : ''
           })
         }
+      } else if (event.type === 'preview.read.request') {
+        // read_preview tool: serialize the active preview tab (a Browser
+        // webview's page text is async) and answer. Empty text = nothing open.
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+        if (requestId) {
+          const start = typeof payload?.start === 'number' ? payload.start : undefined
+          const count = typeof payload?.count === 'number' ? payload.count : undefined
+
+          void readActivePreview({ count, start }).then(result => {
+            void $gateway.get()?.request('preview.read.respond', {
+              request_id: requestId,
+              text: result ? JSON.stringify(result) : ''
+            })
+          })
+        }
+      } else if (event.type === 'window.read.request') {
+        // read_window_below tool: main owns native window enumeration, so ask
+        // it over IPC and answer. Empty text = unavailable (no bridge, or
+        // enumeration unsupported on this system e.g. Wayland).
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+
+        if (requestId) {
+          const read = window.hermesDesktop?.readWindowBelow
+
+          const answer = (result: unknown) =>
+            $gateway.get()?.request('window.read.respond', {
+              request_id: requestId,
+              text: result ? JSON.stringify(result) : ''
+            })
+
+          // .catch: ipcRenderer.invoke rejects on an older shell without the
+          // handler or a main-side throw — without an empty answer the tool
+          // would stall its full 30s timeout.
+          void Promise.resolve(read ? read() : null).then(answer, () => answer(null))
+        }
       } else if (event.type === 'agent.terminal.output') {
         // Live chunk from a background process → its read-only agent terminal tab.
         writeAgentTerminalChunk(payload?.process_id ?? '', payload?.chunk ?? '')
@@ -1066,7 +1232,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // change happens silently. Surface it as a persistent system message
         // in the transcript so the user is always informed — it must not be a
         // transient toast that can be missed.
-        const text = coerceGatewayText(payload?.text).trim()
+        //
+        // Typed here with the `review:` marker (same convention as `steer:` /
+        // `slash:`) so SystemMessage can paint it as the memory-write row it
+        // is instead of sniffing the backend's prose. The leading 💾 goes with
+        // it — the row draws its own glyph.
+        const text = coerceGatewayText(payload?.text)
+          .trim()
+          .replace(/^[^\p{L}\p{N}]+/u, '')
 
         if (text && sessionId) {
           flushQueuedDeltas(sessionId)
@@ -1077,7 +1250,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               {
                 id: `review-summary-${Date.now()}`,
                 role: 'system',
-                parts: [textPart(text)],
+                parts: [textPart(`review:${text}`)],
                 timestamp: Math.floor(Date.now() / 1000)
               }
             ]
@@ -1143,6 +1316,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (looksLikeProviderSetup) {
           requestDesktopOnboarding(errorMessage)
+        } else if (isDiskFullErrorMessage(errorMessage)) {
+          notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {
           // Toast globally, not just when the failing thread is focused: a
           // turn-ending error (e.g. out of funds) blocks every thread, so the

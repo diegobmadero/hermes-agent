@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -46,10 +47,12 @@ import type {
   PairingResponse,
   PairingUser,
   ProfileCreatePayload,
+  ProfileDesktopOverlay,
   ProfileSetupCommand,
   ProfileSoul,
   ProfilesResponse,
   SessionInfo,
+  SessionMessage,
   SessionMessagesResponse,
   SessionSearchResponse,
   SkillHubPreview,
@@ -185,6 +188,7 @@ export type {
   PairingResponse,
   PairingUser,
   ProfileCreatePayload,
+  ProfileDesktopOverlay,
   ProfileInfo,
   ProfileSetupCommand,
   ProfileSoul,
@@ -349,8 +353,12 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       socket = null
 
       if (!disposed) {
+        // Full-jitter exponential backoff: same rationale as the gateway
+        // socket reconnect loops — an immediate-retry loop across many
+        // desktop clients floods the gateway with connection attempts
+        // during a restart.
+        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
         attempt += 1
-        window.setTimeout(() => void connect(), Math.min(30_000, 1_000 * 2 ** attempt))
       }
     }
   }
@@ -361,6 +369,26 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
     disposed = true
     socket?.close()
   }
+}
+
+/**
+ * Trim a page to its window WITHOUT discarding pinned rows.
+ *
+ * The list endpoints deliberately back-fill pinned conversations past their
+ * LIMIT — a pin means "always reachable", so an aged-out pinned chat is
+ * appended after the recency window. A plain `slice(0, limit)` throws exactly
+ * those rows away again, which is why pins silently stopped rendering past
+ * some count: the sidebar could only ever show the pins that happened to fall
+ * inside the most-recent page.
+ */
+function pageWindow(sessions: SessionInfo[], limit: number): SessionInfo[] {
+  if (sessions.length <= limit) {
+    return sessions
+  }
+
+  const recent = sessions.slice(0, limit)
+
+  return [...recent, ...sessions.slice(limit).filter(session => session.pinned)]
 }
 
 export async function listSessions(
@@ -378,7 +406,7 @@ export async function listSessions(
 
   return {
     ...result,
-    sessions: result.sessions.slice(0, limit),
+    sessions: pageWindow(result.sessions, limit),
     offset: 0
   }
 }
@@ -419,7 +447,7 @@ export async function listAllProfileSessions(
 
   return {
     ...result,
-    sessions: result.sessions.slice(0, limit),
+    sessions: pageWindow(result.sessions, limit),
     offset: 0
   }
 }
@@ -434,18 +462,23 @@ export interface SidebarSessionSlice {
   /** Per-profile "the window came back full, more rows exist on disk" flags —
    *  what pagination needs, without a COUNT(*) per profile DB per refresh. */
   profiles_truncated?: Record<string, boolean>
+  /** Per-profile tokens and spend over every session, not just this window.
+   *  Absent from the legacy per-slice endpoint, which has no aggregate. */
+  profiles_usage?: Record<string, { cost_usd: number; tokens: number }>
 }
 
 /** Which profiles filled their per-profile window in a returned page. The
  *  legacy per-slice endpoint doesn't report this, so derive it from the rows:
- *  a profile at (or over) the cap still has more on disk. */
+ *  a profile at (or over) the cap still has more on disk. Pinned rows are
+ *  discounted — they're back-filled past the LIMIT, so counting them fakes a
+ *  full page and leaves a "Load more" that can never resolve. */
 function profilesTruncatedFrom(sessions: SessionInfo[], cap: number): Record<string, boolean> {
   const counts = new Map<string, number>()
 
   for (const session of sessions) {
     const key = session.profile || 'default'
 
-    counts.set(key, (counts.get(key) ?? 0) + 1)
+    counts.set(key, (counts.get(key) ?? 0) + (session.pinned ? 0 : 1))
   }
 
   return Object.fromEntries([...counts].map(([name, count]) => [name, count >= cap]))
@@ -529,6 +562,23 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
     messaging: { sessions: messaging.sessions },
     ...(errors.length ? { errors } : {})
   }
+}
+
+/** The PR each of these sessions opened, recovered from its own transcript —
+ *  for sessions whose recorded branch can't answer (they started on trunk and
+ *  did the work in a worktree). Also returns every id it looked at, so the
+ *  caller can remember a miss and never ask again. */
+export function scanSessionPullRequests(
+  ids: string[]
+): Promise<{ pull_requests: Record<string, { number: number; url: string }>; scanned: string[] }> {
+  return window.hermesDesktop.api<{
+    pull_requests: Record<string, { number: number; url: string }>
+    scanned: string[]
+  }>({
+    path: '/api/profiles/sessions/pull-requests',
+    method: 'POST',
+    body: { ids }
+  })
 }
 
 export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
@@ -626,13 +676,80 @@ export function getSession(id: string, profile?: string | null): Promise<Session
 // this GET to the remote backend (which serves its own state.db); for a local
 // profile the primary opens that profile's state.db via ?profile=. Omit for
 // the current/default profile.
-export function getSessionMessages(id: string, profile?: string | null): Promise<SessionMessagesResponse> {
-  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+export function getSessionMessages(
+  id: string,
+  profile?: string | null,
+  page: { limit?: number; offset?: number; order?: 'latest' | 'oldest' } = {}
+): Promise<SessionMessagesResponse> {
+  const query = new URLSearchParams()
+
+  if (profile) {
+    query.set('profile', profile)
+  }
+
+  if (page.limit !== undefined) {
+    query.set('limit', String(page.limit))
+  }
+
+  if (page.offset !== undefined) {
+    query.set('offset', String(page.offset))
+  }
+
+  if (page.order) {
+    query.set('order', page.order)
+  }
+
+  const suffix = query.size ? `?${query.toString()}` : ''
 
   return window.hermesDesktop.api<SessionMessagesResponse>({
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
   })
+}
+
+export function getLatestSessionMessages(id: string, profile?: string | null): Promise<SessionMessagesResponse> {
+  return getSessionMessages(id, profile, { limit: 500, order: 'latest' })
+}
+
+export async function getAllSessionMessages(
+  id: string,
+  profile?: string | null,
+  options: { maxJsonChars?: number } = {}
+): Promise<SessionMessagesResponse> {
+  const messages: SessionMessage[] = []
+  const pageSize = 500
+  const maxJsonChars = options.maxJsonChars ?? 32_000_000
+  let jsonChars = 0
+  let offset = 0
+  let resolvedSessionId = id
+
+  while (true) {
+    const page = await getSessionMessages(id, profile, {
+      limit: pageSize,
+      offset,
+      order: 'oldest'
+    })
+
+    resolvedSessionId = page.session_id
+    jsonChars += (JSON.stringify(page.messages) ?? '').length
+
+    if (jsonChars > maxJsonChars) {
+      throw new Error(
+        'Session transcript exceeds the Desktop safe-load limit; use the Web Dashboard export for this session.'
+      )
+    }
+
+    messages.push(...page.messages)
+
+    // Legacy backends ignore pagination and return the full transcript.
+    if (!page.pagination || page.messages.length === 0 || page.messages.length < page.pagination.limit) {
+      break
+    }
+
+    offset += page.messages.length
+  }
+
+  return { session_id: resolvedSessionId, messages }
 }
 
 export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {
@@ -795,12 +912,14 @@ export function validateProviderCredential(
 
 export function getCustomEndpoints(): Promise<CustomEndpointsResponse> {
   return window.hermesDesktop.api<CustomEndpointsResponse>({
+    ...profileScoped(),
     path: '/api/providers/custom-endpoints'
   })
 }
 
 export function saveCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<CustomEndpointsResponse> {
   return window.hermesDesktop.api<CustomEndpointsResponse>({
+    ...profileScoped(),
     path: '/api/providers/custom-endpoints',
     method: 'POST',
     body: endpoint
@@ -817,6 +936,7 @@ export function validateCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<
 
 export function activateCustomEndpoint(id: string): Promise<{ ok: boolean; provider: string; model: string }> {
   return window.hermesDesktop.api<{ ok: boolean; provider: string; model: string }>({
+    ...profileScoped(),
     path: `/api/providers/custom-endpoints/${encodeURIComponent(id)}/activate`,
     method: 'POST'
   })
@@ -824,6 +944,7 @@ export function activateCustomEndpoint(id: string): Promise<{ ok: boolean; provi
 
 export function deleteCustomEndpoint(id: string): Promise<CustomEndpointsResponse> {
   return window.hermesDesktop.api<CustomEndpointsResponse>({
+    ...profileScoped(),
     path: `/api/providers/custom-endpoints/${encodeURIComponent(id)}`,
     method: 'DELETE'
   })
@@ -960,7 +1081,10 @@ export function editLearningNode(id: string, content: string): Promise<{ message
   })
 }
 
-export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+export function setSkillEnabled(
+  name: string,
+  enabled: boolean
+): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
     ...profileScoped(),
     path: '/api/skills/toggle',
@@ -1027,6 +1151,16 @@ export function getMcpOAuthFlow(flowId: string): Promise<McpOAuthFlow> {
   })
 }
 
+/** Cancel an in-flight MCP OAuth flow server-side, freeing the per-server
+ *  "already in progress" slot so a retry doesn't 409. */
+export function cancelMcpOAuthFlow(flowId: string): Promise<{ ok: boolean; status: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; status: string }>({
+    ...profileScoped(),
+    path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
+    method: 'DELETE'
+  })
+}
+
 export function getToolsets(): Promise<ToolsetInfo[]> {
   return window.hermesDesktop.api<ToolsetInfo[]>({
     ...profileScoped(),
@@ -1034,7 +1168,7 @@ export function getToolsets(): Promise<ToolsetInfo[]> {
   })
 }
 
-export function toggleToolset(
+export function setToolsetEnabled(
   name: string,
   enabled: boolean
 ): Promise<{ ok: boolean; name: string; enabled: boolean }> {
@@ -1423,6 +1557,36 @@ export function getProfileSetupCommand(name: string): Promise<ProfileSetupComman
   })
 }
 
+/** Export a profile to a shareable .tar.gz on the backend's filesystem.
+ *  `extraFiles` stages extra root-level files (desktop.json — the appearance/
+ *  interface overlay) into the archive alongside the profile's own artifacts. */
+export function exportProfileArchive(
+  name: string,
+  opts: { extraFiles?: Record<string, string>; output?: string } = {}
+): Promise<{ archive: string; ok: boolean }> {
+  return window.hermesDesktop.api<{ archive: string; ok: boolean }>({
+    path: `/api/profiles/${encodeURIComponent(name)}/export`,
+    method: 'POST',
+    body: { extra_files: opts.extraFiles ?? {}, output: opts.output ?? '' },
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+/** Import a profile .tar.gz as a new profile. Returns the bundled desktop
+ *  appearance overlay too (when the archive carried one) so the caller can
+ *  apply theme/layout without another round-trip. */
+export function importProfileArchive(
+  archive: string,
+  name?: string
+): Promise<{ desktop: null | ProfileDesktopOverlay; name: string; ok: boolean; path: string }> {
+  return window.hermesDesktop.api<{ desktop: null | ProfileDesktopOverlay; name: string; ok: boolean; path: string }>({
+    path: '/api/profiles/import',
+    method: 'POST',
+    body: { archive, name: name || null },
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
 export function getUsageAnalytics(days = 30): Promise<AnalyticsResponse> {
   return window.hermesDesktop.api<AnalyticsResponse>({
     ...profileScoped(),
@@ -1669,6 +1833,34 @@ export function listMcpServers(): Promise<{ servers: McpServerSummary[] }> {
   return window.hermesDesktop.api<{ servers: McpServerSummary[] }>({
     ...profileScoped(),
     path: '/api/mcp/servers'
+  })
+}
+
+/** Add one server to `mcp_servers` (validated + name-collision-checked
+ *  server-side — the same endpoint the dashboard's add form uses). */
+export function addMcpServer(body: {
+  name: string
+  url?: string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  auth?: string
+}): Promise<McpServerSummary> {
+  return window.hermesDesktop.api<McpServerSummary>({
+    ...profileScoped(),
+    path: '/api/mcp/servers',
+    method: 'POST',
+    body
+  })
+}
+
+/** Remove one server from `mcp_servers` (the inline setup card's rollback
+ *  when a directory install is cancelled after the config write). */
+export function removeMcpServer(name: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: `/api/mcp/servers/${encodeURIComponent(name)}`,
+    method: 'DELETE'
   })
 }
 
