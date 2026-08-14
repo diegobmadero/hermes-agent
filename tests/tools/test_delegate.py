@@ -422,13 +422,26 @@ class TestDelegateTask(unittest.TestCase):
         }
         parent = _make_mock_parent()
 
+        # Upstream batch gate requires >=2 tasks; keep a second real goal so
+        # this still exercises per-task timeout_seconds=None inheritance.
         delegate_task(
-            tasks=[{"goal": "Inherit cap", "timeout_seconds": None}],
+            tasks=[
+                {
+                    "goal": "Inherit cap from the top-level timeout override",
+                    "timeout_seconds": None,
+                },
+                {"goal": "Second concrete batch task for gate validity"},
+            ],
             timeout_seconds=900,
             parent_agent=parent,
         )
 
-        self.assertEqual(mock_run.call_args.kwargs["timeout_seconds"], 900.0)
+        by_index = {
+            call.kwargs["task_index"]: call.kwargs["timeout_seconds"]
+            for call in mock_run.call_args_list
+        }
+        self.assertEqual(by_index[0], 900.0)
+        self.assertEqual(by_index[1], 900.0)
 
     @patch("tools.delegate_tool._run_single_child")
     def test_invalid_timeout_override_rejected(self, mock_run):
