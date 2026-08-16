@@ -550,6 +550,16 @@ def _contains_unsafe_gateway_action(
                 return True
         if not script_text:
             continue
+        # Python is run by the interpreter, not a POSIX shell. Walking the
+        # source as a shell script tokenizes pathlib paths and string
+        # literals (e.g. cache dirs that now exist on disk) and fail-closes
+        # on those directories — blocking innocent `ask_agent.py` / other
+        # .py CLIs from the Telegram gateway. Same exemption as cron
+        # check_gateway_lifecycle (#77131): direct regex only.
+        if script_path.suffix == ".py" or resolved.suffix == ".py":
+            if _direct_lifecycle_scan(script_text):
+                return True
+            continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
