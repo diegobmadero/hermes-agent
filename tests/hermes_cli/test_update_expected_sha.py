@@ -110,6 +110,8 @@ def test_guarded_update_uses_single_fetch_ff_only_merge_and_checks_head(
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{BRANCH}\n", stderr="")
         if cmd == ["git", "rev-list", f"HEAD..origin/{BRANCH}", "--count"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
         if cmd == ["git", "rev-parse", "HEAD"]:
             head_reads += 1
             value = OTHER if head_reads == 1 else EXPECTED
@@ -148,6 +150,8 @@ def test_guarded_ff_only_failure_never_uses_reset(monkeypatch, tmp_path):
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{BRANCH}\n", stderr="")
         if cmd == ["git", "rev-list", f"HEAD..origin/{BRANCH}", "--count"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
         if cmd == ["git", "rev-parse", "HEAD"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{OTHER}\n", stderr="")
         if cmd == ["git", "merge", "--ff-only", f"origin/{BRANCH}"]:
@@ -181,6 +185,8 @@ def test_guarded_update_rejects_post_merge_head_mismatch(monkeypatch, tmp_path, 
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{BRANCH}\n", stderr="")
         if cmd == ["git", "rev-list", f"HEAD..origin/{BRANCH}", "--count"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
         if cmd == ["git", "rev-parse", "HEAD"]:
             head_reads += 1
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{OTHER}\n", stderr="")

@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover — runtime import is lazy (see below)
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +49,37 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _resolve_requests_verify() -> bool | str:
-    """Resolve SSL verify setting for `requests` calls from env vars.
+def _resolve_requests_verify(base_url: str = "") -> bool | str:
+    """Resolve SSL verify setting for `requests` calls.
 
-    The `requests` library only honours REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
-    by default. Hermes also honours HERMES_CA_BUNDLE (its own convention)
-    and SSL_CERT_FILE (used by the stdlib `ssl` module and by httpx), so
-    that a single env var can cover both `requests` and `httpx` callsites
-    inside the same process.
+    Priority (mirrors ``agent.ssl_verify.resolve_httpx_verify`` so the
+    ``requests``-based ``/models`` probes agree with the httpx chat client):
 
-    Returns either a filesystem path to a CA bundle, or True to defer to
-    the requests default (certifi).
+    1. Per-provider ``ssl_verify: false`` for ``base_url`` — disable verification.
+    2. Per-provider ``ssl_ca_cert`` for ``base_url`` — an explicit CA bundle.
+       Without this, a custom endpoint whose chain only verifies against the
+       provider's configured bundle (not the process ``SSL_CERT_FILE``) logs a
+       spurious CERTIFICATE_VERIFY_FAILED on every probe even though the chat
+       path succeeds (per-provider ``ssl_ca_cert`` was reaching only httpx).
+    3. Env vars ``HERMES_CA_BUNDLE`` / ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE``
+       (a single var covers both ``requests`` and ``httpx`` in-process).
+    4. ``True`` — defer to the requests default (certifi).
+
+    ``base_url`` is optional so existing callers (OpenRouter, etc.) keep the
+    env-only behavior unchanged; only probes that pass a base_url pick up the
+    per-provider override.
     """
+    if base_url:
+        try:
+            from hermes_cli.config import get_custom_provider_tls_settings
+            tls = get_custom_provider_tls_settings(base_url)
+            if tls.get("ssl_verify") is False:
+                return False
+            ca = tls.get("ssl_ca_cert")
+            if isinstance(ca, str) and ca and os.path.isfile(ca):
+                return ca
+        except Exception:
+            pass  # fall through to env vars — never break a probe on config lookup
     for env_var in ("HERMES_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
         val = os.getenv(env_var)
         if val and os.path.isfile(val):
@@ -481,13 +501,19 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://platform.minimax.io/docs/api-reference/text-chat-openai
     "minimax-m3": 1000000,
     "minimax": 204800,
-    # GLM — GLM-5.2 ships with a 1M context window (verified empirically:
-    # needle-in-a-haystack retrieval at 789K prompt tokens succeeded with
-    # zero errors on api.z.ai/api/coding/paas/v4).  Older GLM models
-    # (5, 5.1, 5-turbo) are ~202K.  Longest-key-first substring matching
-    # ensures "glm-5.2" resolves to 1M while older variants still hit the
-    # generic 202K fallback.
+    # GLM — GLM-5.2 and GLM-5.3 ship with a 1M context window.  GLM-5.2 was
+    # verified empirically (needle-in-a-haystack retrieval at 789K prompt
+    # tokens succeeded with zero errors on api.z.ai/api/coding/paas/v4).
+    # GLM-5.3 uses the same base model (all gains are post-training) with
+    # 1M context / 128K max output per docs.z.ai/guides/llm/glm-5.3
+    # (verified 2026-08-14).  Older GLM models (5, 5.1, 5-turbo) are ~202K.
+    # Longest-key-first substring matching ensures "glm-5.2"/"glm-5.3"
+    # resolve to 1M while older variants still hit the generic 202K fallback.
     "glm-5.2": 1_048_576,
+    # OpenRouter's free GLM-5.2 variant is capped at 256K (live metadata,
+    # 2026-08-21) — longer key wins over the 1M paid entry above.
+    "glm-5.2:free": 256_000,
+    "glm-5.3": 1_048_576,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Hermes from probing-down to
@@ -536,8 +562,22 @@ DEFAULT_CONTEXT_LENGTHS = {
     "hy3-preview": 262144,
     # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
     "hy3": 262144,
+    # OpenCode Zen — "Ox Alpha" stealth model (x-preview-f-free). 1M context
+    # per OpenCode's launch announcement (2026-08-20); free, ZDR.
+    "x-preview-f": 1_048_576,
+    # OpenRouter — same "Ox Alpha" stealth model under its OpenRouter slug
+    # (stealth/ox-alpha). 1M context per OpenRouter live metadata (2026-08-20).
+    "ox-alpha": 1_048_576,
     # Nemotron — NVIDIA's open-weights series (128K context across all sizes)
+    # EXCEPT 3.5 Lightning, which ships a 1M window (OpenRouter live metadata
+    # + OpenCode Zen free tier, verified 2026-08-21).
+    "nemotron-3.5-lightning": 1_000_000,
     "nemotron": 131072,
+    # Poolside Laguna 2.1 (s/xs) — 256K window per OpenRouter live metadata
+    # (2026-08-21). Covers laguna-s-2.1:free, laguna-xs-2.1:free, and the
+    # OpenCode Zen laguna-s-2.1-free slug via substring matching.
+    "laguna-s-2.1": 262144,
+    "laguna-xs-2.1": 262144,
     # Arcee
     "trinity": 262144,
     # OpenRouter
@@ -1261,7 +1301,7 @@ def fetch_endpoint_model_metadata(
                     server_url.rstrip("/") + "/api/v1/models",
                     headers=headers,
                     timeout=(5, 10),
-                    verify=_resolve_requests_verify(),
+                    verify=_resolve_requests_verify(normalized),
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -1324,7 +1364,7 @@ def fetch_endpoint_model_metadata(
                 url,
                 headers=headers,
                 timeout=(5, 10),
-                verify=_resolve_requests_verify(),
+                verify=_resolve_requests_verify(normalized),
                 stream=True,
             )
             if response.status_code in (401, 403):
@@ -1364,7 +1404,7 @@ def fetch_endpoint_model_metadata(
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
                     base = request_candidate.rstrip("/").replace("/v1", "")
-                    _verify = _resolve_requests_verify()
+                    _verify = _resolve_requests_verify(normalized)
                     props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5, verify=_verify)
                     if not props_resp.ok:
                         props_resp = requests.get(base + "/props", headers=headers, timeout=5, verify=_verify)
@@ -1639,9 +1679,27 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # The input itself fits — this is purely an output-cap error, so reduce
         # max_tokens and retry; do NOT compress.
         "range of max_tokens should be" in error_lower
+    ) or (
+        # OpenAI-compatible relays may reject a request whose output cap exceeds
+        # the model's separate completion-token limit, e.g.
+        #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
+        # This is independent of the input context window.
+        "exceeds model" in error_lower
+        and "maximum output tokens" in error_lower
     )
     if not is_output_cap_error:
         return None
+
+    # Generic model-output-cap form:
+    #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
+    _m_max_output = re.search(
+        r'exceeds model(?:\'s)? maximum output tokens\s*\(?\s*(\d+)\s*\)?',
+        error_lower,
+    )
+    if _m_max_output:
+        _cap = int(_m_max_output.group(1))
+        if _cap >= 1:
+            return _cap
 
     # DashScope / Alibaba range form: "Range of max_tokens should be [1, 65536]".
     # The upper bound is the available output cap.
@@ -1706,11 +1764,28 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     # Available output = window - input. When the input alone is at or over
     # the window this stays None, so the caller correctly falls through to
     # compression instead of futilely shrinking the output cap.
+    #
+    # Caveat: when max_tokens is the BINDING constraint, vLLM does not report
+    # the real prompt size at all.  It back-computes a lower bound from the
+    # constraint itself -- "at least N input tokens" where
+    # N == window + 1 - requested_output -- so window - N is always exactly
+    # requested_output - 1.  Subtracting the caller's safety margin then walks
+    # the cap down ~65 tokens per retry while the reported input walks up by
+    # the same amount, burning every compression attempt without ever fitting.
+    # Detect that degenerate case and halve the requested cap instead: it
+    # carries the same guarantee (strictly below what was rejected) and
+    # converges in one or two retries.
     _m_vllm_input = re.search(
         r'prompt contains (?:at least )?(\d+)\s*input tokens', error_lower
     )
     if _m_ctx_tok and _m_vllm_input:
         _available = int(_m_ctx_tok.group(1)) - int(_m_vllm_input.group(1))
+        _m_requested_out = re.search(r'requested (\d+)\s*output tokens', error_lower)
+        if 'at least' in error_lower and _m_requested_out:
+            _requested_out = int(_m_requested_out.group(1))
+            if _available >= _requested_out - 1:
+                # The budget is derived from the constraint, not measured.
+                return max(1, _requested_out // 2)
         if _available >= 1:
             return _available
 
@@ -1762,6 +1837,8 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "should be" in error_lower                       # generic "max_tokens should be <= N"
         or "less than or equal" in error_lower
         or "must be" in error_lower
+        or ("exceeds model" in error_lower
+            and "maximum output tokens" in error_lower)
     )
     if not output_cap_signal:
         return False
@@ -2284,7 +2361,7 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
             "anthropic-version": "2023-06-01",
         }
         _ensure_requests()
-        resp = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
+        resp = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify(base_url))
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -2321,11 +2398,63 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
+    "gpt-daybreak-blue-latest": 272_000,
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
     "gpt-5": 272_000,
 }
+
+# Codex OAuth advertises 272K via /backend-api/codex/models for these
+# families, but the backend actually ACCEPTS far more. OpenAI enabled the
+# large-context window for ChatGPT-subscription Codex accounts on
+# Aug 16 2026 (announced by @thsottiaux; previously API-key-only).
+# Verified live against chatgpt.com/backend-api/codex/responses the same
+# day: 911,276 input tokens completed OK on gpt-5.6-sol; ~925K+ rejected
+# with ``context_length_exceeded`` (the 1.05M window minus reserved output
+# headroom). gpt-5.6-terra, gpt-5.6-luna, and gpt-5.4 all completed 900,026
+# tokens OK. gpt-5.5 and gpt-5.4-mini still rejected >272K, so their
+# advertisement is real enforcement and they are NOT listed. 900K keeps
+# ≥11K margin under the observed ceiling and matches the compaction point
+# Codex's own client config documents for the 1M window.
+#
+# Applied ONLY when the resolved value (live probe or fallback table) is
+# exactly the known-stale 272,000 advertisement — if OpenAI moves the
+# advertised number in either direction (the gpt-5.6 family shifted
+# 272K → 372K → 272K during July 2026), the catalog is trusted again and
+# this table is inert. ``gpt-5.6`` is a FAMILY PREFIX (sol/terra/luna and
+# dated snapshots; ``-pro`` slugs are not routable on Codex OAuth — the
+# backend 400s them — so over-matching there is moot). ``gpt-5.4`` is EXACT:
+# gpt-5.4-mini was probed and genuinely enforces 272K (rejected 500K), so
+# prefix-matching the 5.4 family would over-report for mini.
+_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
+    "gpt-5.6": 900_000,   # sol / terra / luna — all three verified live at 900K
+}
+_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
+    "gpt-5.4": 900_000,   # verified live at 900K; gpt-5.4-mini rejected 500K — excluded
+    "gpt-daybreak-blue-latest": 900_000,  # exact Daybreak/Sol alias verified at 911,276
+}
+
+# The advertised value the verified-above table is allowed to override.
+_CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000
+
+
+def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
+    """Return the live-verified Codex cap for a slug, or ``None``.
+
+    Exact slugs first, then family prefixes (``<key>``, ``<key>-``,
+    ``<key>.``) so dated snapshots of a verified family inherit the bump.
+    """
+    slug = (model_bare or "").strip().lower()
+    if not slug:
+        return None
+    exact = _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.get(slug)
+    if exact is not None:
+        return exact
+    for key, ctx in _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES.items():
+        if slug == key or slug.startswith(key + "-") or slug.startswith(key + "."):
+            return ctx
+    return None
 
 
 _codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
@@ -2454,16 +2583,33 @@ def _resolve_codex_oauth_context_length_with_source(
     if not model_bare:
         return None, ""
 
+    def _apply_verified_bump(ctx: int, source: str) -> Tuple[int, str]:
+        """Lift a known-stale 272K advertisement to the live-verified cap.
+
+        Only fires when the resolved value is EXACTLY the stale 272,000
+        advertisement for a slug we have probed above it (see
+        ``_verified_codex_ctx_for_slug``). Any other advertised value —
+        higher or lower — is trusted as a real server-side change.
+        """
+        bumped = _verified_codex_ctx_for_slug(model_bare)
+        if bumped is not None and ctx == _CODEX_OAUTH_STALE_ADVERTISED_CTX:
+            logger.debug(
+                "Codex OAuth context for %s: advertised %d raised to "
+                "live-verified %d", model_bare, ctx, bumped,
+            )
+            return bumped, source
+        return ctx, source
+
     if access_token:
         live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
         live_source = "live" if fresh_probe else "memory"
         if model_bare in live:
-            return live[model_bare], live_source
+            return _apply_verified_bump(live[model_bare], live_source)
         # Case-insensitive match in case casing drifts
         model_lower = model_bare.lower()
         for slug, ctx in live.items():
             if slug.lower() == model_lower:
-                return ctx, live_source
+                return _apply_verified_bump(ctx, live_source)
 
     # Fallback: longest-key-first substring match over hardcoded defaults.
     model_lower = model_bare.lower()
@@ -2471,7 +2617,7 @@ def _resolve_codex_oauth_context_length_with_source(
         _CODEX_OAUTH_CONTEXT_FALLBACK.items(), key=lambda x: len(x[0]), reverse=True
     ):
         if slug in model_lower:
-            return ctx, "fallback"
+            return _apply_verified_bump(ctx, "fallback")
 
     return None, ""
 
@@ -3331,7 +3477,7 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     )
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details"):
+        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
