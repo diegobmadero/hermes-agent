@@ -1859,6 +1859,8 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
+    index_mode: str = "full",
+    featured_skills: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1879,7 +1881,24 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``index_mode`` is profile-level prompt policy: ``full`` preserves the
+    complete catalog, ``names`` keeps every eligible name but drops all
+    descriptions, ``featured`` advertises only ``featured_skills``, and
+    ``off`` omits the catalog. Featured/off affect prompt disclosure only;
+    the skills tools retain access to every installed, non-disabled skill.
     """
+    normalized_mode = str(index_mode or "full").strip().lower()
+    if normalized_mode not in {"full", "names", "featured", "off"}:
+        normalized_mode = "full"
+    normalized_featured = frozenset(
+        str(name).strip().casefold()
+        for name in (featured_skills or frozenset())
+        if str(name).strip()
+    )
+    if normalized_mode == "off":
+        return ""
+
     # Home resolution is EXPLICIT when a caller passes skills_dir_override
     # (the agent knows its own profile home from its session_db path). This
     # avoids the ContextVar-on-a-thread trap: build threads that didn't bind
@@ -1912,6 +1931,8 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
+            index_mode=normalized_mode,
+            featured_skills=normalized_featured,
         )
     finally:
         if _home_token is not None:
@@ -1925,6 +1946,8 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    index_mode: str = "full",
+    featured_skills: "frozenset[str] | None" = None,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
@@ -1940,6 +1963,8 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        index_mode,
+        tuple(sorted(featured_skills or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -2148,22 +2173,51 @@ def _build_skills_system_prompt_inner(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
-    # Posture-driven category demotion (e.g. non-coding skills while pairing
-    # on code). Demoted categories stay in the index as a single names-only
-    # line — descriptions are dropped to cut noise, but every skill name
-    # remains visible so memory-anchored recall ("load <name>") keeps working.
-    # NEVER remove entries entirely: agent-created skills are the model's
-    # project memory, and models don't reach for skills_list to rediscover
-    # what the index stops showing them. Match on the top-level category
-    # segment so nested categories ("social-media/twitter") are demoted with
-    # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
-    )
+    # Profile-level disclosure policy. ``featured`` changes only what the
+    # model sees in the initial prompt; skill discovery/loading remains backed
+    # by the complete installed skill roots.
+    featured_note = ""
+    if index_mode == "featured":
+        wanted = featured_skills or frozenset()
+        total_before = sum(len(items) for items in skills_by_category.values())
+        skills_by_category = {
+            category: [
+                (name, desc)
+                for name, desc in items
+                if name.casefold() in wanted
+            ]
+            for category, items in skills_by_category.items()
+        }
+        skills_by_category = {
+            category: items
+            for category, items in skills_by_category.items()
+            if items
+        }
+        total_after = sum(len(items) for items in skills_by_category.values())
+        if total_before > total_after:
+            featured_note = (
+                "\n(Only featured skills are listed. Other installed skills remain "
+                "available on demand via skills_list or skill_view when named.)"
+            )
+
+    # Posture-driven or profile-wide category demotion. Demoted categories stay
+    # in the index as a single names-only line, so every advertised skill name
+    # remains loadable while descriptions stop consuming the fixed prompt.
+    if index_mode == "names":
+        demoted = frozenset(skills_by_category)
+    else:
+        demoted = frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        )
 
     hidden_note = ""
-    if demoted:
+    if index_mode == "names" and demoted:
+        hidden_note = (
+            "\n(The skills index is names-only to save tokens; every listed skill "
+            "loads normally with skill_view(name).)"
+        )
+    elif demoted:
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
@@ -2223,6 +2277,7 @@ def _build_skills_system_prompt_inner(
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
+            + featured_note
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

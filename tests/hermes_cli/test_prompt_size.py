@@ -54,6 +54,27 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     assert data["system_prompt"]["bytes"] > 0
 
 
+def test_featured_skills_index_config_applies_end_to_end(isolated_home):
+    _seed_skill(isolated_home, "pepchat", "Research PepChat communities")
+    _seed_skill(isolated_home, "telegram", "Operate Telegram")
+    _seed_skill(isolated_home, "unused-large-skill", "x" * 2000)
+    (isolated_home / "config.yaml").write_text(
+        "skills:\n"
+        "  index_mode: featured\n"
+        "  index_featured:\n"
+        "    - pepchat\n"
+        "    - telegram\n",
+        encoding="utf-8",
+    )
+
+    data = compute_prompt_breakdown("cli")
+    names = {entry["name"] for entry in data["skills_breakdown"]}
+
+    assert names == {"pepchat", "telegram"}
+    assert "unused-large-skill" not in names
+    assert data["skills_index"]["chars"] < 4000
+
+
 
 
 

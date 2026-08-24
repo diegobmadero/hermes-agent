@@ -623,6 +623,27 @@ Commands that require `stdin_data` or sudo automatically fall back to one-shot m
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
 
+## Skills prompt index
+
+Hermes normally advertises every eligible skill and its description in the initial system prompt. Large shared skill libraries can use a substantial part of a local model's fixed context. Configure a lighter, profile-scoped index without disabling or deleting any skills:
+
+```yaml
+skills:
+  # full (default) | names | featured | off
+  index_mode: featured
+  index_featured:
+    - hermes-agent
+    - research-intelligence
+    - telegram
+```
+
+- `full` lists every eligible skill with its description.
+- `names` lists every eligible skill name but omits descriptions.
+- `featured` lists only `index_featured`, with descriptions.
+- `off` omits the initial catalog.
+
+These settings control prompt disclosure only. `skills_list` still discovers the complete installed library, and `skill_view` can load any installed, non-disabled skill by name. The index is frozen when a conversation starts; apply changes with a new/reset session rather than mutating a warm conversation's prefix.
+
 ## Skill Settings
 
 Skills can declare their own configuration settings via their SKILL.md frontmatter. These are non-secret values (paths, preferences, domain settings) stored under the `skills.config` namespace in `config.yaml`.

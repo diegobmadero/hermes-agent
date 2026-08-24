@@ -24,6 +24,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -80,6 +81,28 @@ def _prompt_parts(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)
+
+
+def test_skills_index_policy_is_forwarded_to_prompt_builder():
+    agent = _make_agent(
+        valid_tool_names=["skills_list", "skill_view", "skill_manage"],
+        _skills_index_mode="featured",
+        _skills_index_featured=frozenset({"pepchat", "telegram"}),
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.build_skills_system_prompt", return_value="FEATURED") as build_skills,
+    ):
+        parts = build_system_prompt_parts(agent)
+
+    assert "FEATURED" in "\n".join(parts.values())
+    assert build_skills.call_args.kwargs["index_mode"] == "featured"
+    assert build_skills.call_args.kwargs["featured_skills"] == frozenset(
+        {"pepchat", "telegram"}
+    )
 
 
 def _init_code_repo(path):

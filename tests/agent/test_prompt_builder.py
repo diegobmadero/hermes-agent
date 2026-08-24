@@ -346,7 +346,62 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_names_index_keeps_names_but_drops_all_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name, description in (
+            ("research", "paper-search", "Search academic papers"),
+            ("social-media", "pepchat", "Research PepChat communities"),
+        ):
+            d = tmp_path / "skills" / category / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
 
+        prompt = build_skills_system_prompt(index_mode="names")
+
+        assert "paper-search" in prompt
+        assert "pepchat" in prompt
+        assert "Search academic papers" not in prompt
+        assert "Research PepChat communities" not in prompt
+        assert "[names only]" in prompt
+
+    def test_featured_index_only_advertises_selected_skills(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name in ("pepchat", "telegram", "unused-large-skill"):
+            d = tmp_path / "skills" / "research" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Description for {name}\n---\n"
+            )
+
+        prompt = build_skills_system_prompt(
+            index_mode="featured",
+            featured_skills=frozenset({"pepchat", "telegram"}),
+        )
+
+        assert "pepchat" in prompt
+        assert "telegram" in prompt
+        assert "Description for pepchat" in prompt
+        assert "unused-large-skill" not in prompt
+        assert "Other installed skills remain available on demand" in prompt
+
+    def test_off_index_omits_catalog_without_disabling_skill_tools(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "research" / "pepchat"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: pepchat\ndescription: Research PepChat\n---\n"
+        )
+
+        assert build_skills_system_prompt(index_mode="off") == ""
+        assert "pepchat" in build_skills_system_prompt(index_mode="full")
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""

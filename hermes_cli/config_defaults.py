@@ -2055,6 +2055,13 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Initial system-prompt catalog policy. ``full`` lists every eligible
+        # skill with its description; ``names`` lists every name without
+        # descriptions; ``featured`` lists only index_featured entries with
+        # descriptions; ``off`` omits the catalog. All modes leave skills_list
+        # and skill_view access to installed skills unchanged.
+        "index_mode": "full",
+        "index_featured": [],
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the

@@ -1966,11 +1966,31 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
-    # Skills config: nudge interval for skill creation reminders
+    # Skills config: creation reminders plus profile-level prompt-index policy.
+    # Index policy changes disclosure only; all installed skills remain
+    # discoverable/loadable through the skill tools unless separately disabled.
     agent._skill_nudge_interval = 10
+    agent._skills_index_mode = "full"
+    agent._skills_index_featured = frozenset()
     try:
         skills_config = _agent_cfg.get("skills", {})
+        if not isinstance(skills_config, dict):
+            skills_config = {}
         agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        _index_mode = str(skills_config.get("index_mode", "full") or "full").strip().lower()
+        if _index_mode not in {"full", "names", "featured", "off"}:
+            _index_mode = "full"
+        _featured = skills_config.get("index_featured", [])
+        if isinstance(_featured, str):
+            _featured = [_featured]
+        if not isinstance(_featured, (list, tuple, set, frozenset)):
+            _featured = []
+        agent._skills_index_mode = _index_mode
+        agent._skills_index_featured = frozenset(
+            str(name).strip().casefold()
+            for name in _featured
+            if str(name).strip()
+        )
     except Exception:
         pass
 
