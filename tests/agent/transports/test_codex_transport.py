@@ -722,6 +722,63 @@ class TestCodexBuildKwargs:
         assert "hermes_web_search" in names
         assert "web_search" not in names
 
+    def test_xai_renames_reserved_tool_search_on_wire(self, transport):
+        """xAI reserves ``tool_search`` for its native server-side tool."""
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "Find a tool."}],
+            tools=[
+                {"type": "function", "function": {
+                    "name": "tool_search", "description": "Search deferred tools.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+            ],
+            is_xai_responses=True,
+        )
+
+        names = [
+            tool.get("name") for tool in kw.get("tools", [])
+            if tool.get("type") == "function"
+        ]
+        assert "hermes_tool_search" in names
+        assert "tool_search" not in names
+        assert "read_file" in names
+
+    def test_xai_normalize_maps_reserved_tool_search_alias_back(self, transport, monkeypatch):
+        """The xAI wire alias must dispatch through Hermes ``tool_search``."""
+        msg = SimpleNamespace(
+            content=None,
+            reasoning=None,
+            tool_calls=[
+                SimpleNamespace(
+                    id="call_1",
+                    call_id="call_1",
+                    response_item_id="fc_1",
+                    function=SimpleNamespace(
+                        name="hermes_tool_search",
+                        arguments='{"query":"calendar"}',
+                    ),
+                )
+            ],
+            codex_reasoning_items=None,
+            codex_message_items=None,
+            reasoning_details=None,
+        )
+        response = SimpleNamespace(output=[], status="completed")
+
+        monkeypatch.setattr(
+            "agent.codex_responses_adapter._normalize_codex_response",
+            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+        )
+        normalized = transport.normalize_response(response)
+
+        assert normalized.tool_calls is not None
+        assert normalized.tool_calls[0].name == "tool_search"
+
     def test_xai_normalize_maps_client_web_search_alias_back(self, transport, monkeypatch):
         """Alias used on the wire must become ``web_search`` for Hermes dispatch."""
         import agent.transports.codex as codex_mod

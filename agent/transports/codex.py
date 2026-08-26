@@ -67,10 +67,11 @@ _XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
 # rename on the wire (hermes_<name>), map back in normalize_response so
 # Hermes dispatch is unaffected.
 _OPENCODE_RESERVED_TOOL_NAMES = ("web_search", "search_files")
+_XAI_RESERVED_TOOL_NAMES = ("tool_search",)
 _RESERVED_TOOL_ALIAS_PREFIX = "hermes_"
 _RESERVED_ALIAS_TO_NAME = {
     f"{_RESERVED_TOOL_ALIAS_PREFIX}{name}": name
-    for name in _OPENCODE_RESERVED_TOOL_NAMES
+    for name in (*_OPENCODE_RESERVED_TOOL_NAMES, *_XAI_RESERVED_TOOL_NAMES)
 }
 
 
@@ -102,6 +103,19 @@ def _rename_reserved_tools_for_opencode(response_tools: List[Dict[str, Any]]) ->
     rewritten: List[Dict[str, Any]] = []
     for tool in response_tools:
         if isinstance(tool, dict) and tool.get("name") in _OPENCODE_RESERVED_TOOL_NAMES:
+            aliased = dict(tool)
+            aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{tool['name']}"
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
+
+def _rename_reserved_tools_for_xai(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Alias xAI-reserved client function names on the wire."""
+    rewritten: List[Dict[str, Any]] = []
+    for tool in response_tools:
+        if isinstance(tool, dict) and tool.get("name") in _XAI_RESERVED_TOOL_NAMES:
             aliased = dict(tool)
             aliased["name"] = f"{_RESERVED_TOOL_ALIAS_PREFIX}{tool['name']}"
             rewritten.append(aliased)
@@ -552,6 +566,11 @@ class ResponsesApiTransport(ProviderTransport):
                     response_tools = filtered
                 else:
                     response_tools = _rename_client_web_search_for_xai(response_tools)
+
+            # xAI also reserves ``tool_search`` for its native deferred-tool
+            # facility. Hermes exposes a client bridge with that name, so alias
+            # it on the wire and map it back before local dispatch.
+            response_tools = _rename_reserved_tools_for_xai(response_tools)
 
         # OpenCode Responses backends reserve web_search / search_files as
         # function names (HTTP 400 "custom function name 'X' is reserved",
