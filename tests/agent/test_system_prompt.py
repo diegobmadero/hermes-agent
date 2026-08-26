@@ -92,7 +92,6 @@ def test_skills_index_policy_is_forwarded_to_prompt_builder():
     )
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
         patch("run_agent.build_skills_system_prompt", return_value="FEATURED") as build_skills,
