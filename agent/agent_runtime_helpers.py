@@ -693,9 +693,10 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # (#77921).  Popping is non-destructive: an empty array
                 # carries no information.
                 prev.pop("tool_calls", None)
-            # Concatenate plain-text content; leave multimodal (list)
-            # content on either side alone to avoid mangling attachment
-            # blocks — fall back to keeping the existing content.
+            # Preserve multimodal blocks losslessly when collapsing adjacent
+            # assistant turns. Keeping only the earlier list silently drops
+            # attachments from the later turn (notably after compaction removes
+            # a stale synthetic user carrier).
             prev_content = prev.get("content")
             new_content = msg.get("content")
             if isinstance(prev_content, str) and isinstance(new_content, str):
@@ -703,6 +704,20 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                     p for p in (prev_content.strip(), new_content.strip()) if p
                 )
                 prev["content"] = joined
+            elif isinstance(prev_content, list) or isinstance(new_content, list):
+                def _as_content_parts(content: Any) -> List[Any]:
+                    if isinstance(content, list):
+                        return list(content)
+                    if content in (None, ""):
+                        return []
+                    if isinstance(content, str):
+                        return [{"type": "text", "text": content}]
+                    return [{"type": "text", "text": str(content)}]
+
+                prev["content"] = [
+                    *_as_content_parts(prev_content),
+                    *_as_content_parts(new_content),
+                ]
             elif not prev_content and new_content is not None:
                 prev["content"] = new_content
             # Carry reasoning_content from the later turn only if the
@@ -787,11 +802,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         ):
             prev = merged[-1]
             # A summary carrier followed by a new user row is a deliberate
-            # durable shape after retry/rewind.  Do not absorb the fresh ask
-            # into the already-persisted carrier: mutating that dict can make
-            # the only in-memory copy diverge from its durable row.  Provider
-            # sanitizers merge copies later when strict alternation requires
-            # it, without rewriting either durable message.
+            # durable shape after retry/rewind. Do not absorb the fresh ask
+            # into the already-persisted carrier here; the compaction
+            # publication boundary canonicalizes its own summary/user pair.
             from agent.context_compressor import split_user_originated_turn
 
             handoff, _ = split_user_originated_turn(prev)

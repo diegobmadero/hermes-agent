@@ -6707,6 +6707,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        todo_state_payload: Optional[str] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -6839,6 +6840,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if todo_state_payload is not None:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (f"todo_state:{child_session_id}", todo_state_payload),
+                )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -11198,6 +11205,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        todo_state_payload: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11325,6 +11333,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
+
+            if todo_state_payload is not None:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (f"todo_state:{session_id}", todo_state_payload),
+                )
 
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
