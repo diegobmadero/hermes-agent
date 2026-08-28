@@ -4196,22 +4196,6 @@ def compress_context(
             agent._compression_warning = _cc_msg
             agent._emit_status(_cc_msg)
 
-        # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
-        # the completed old session before its details are lost. In in-place mode
-        # there is no old id (same session); ``in_place=True`` tells hooks the
-        # transcript was compacted on the same id rather than rotated.
-        if getattr(agent, "event_callback", None):
-            try:
-                agent.event_callback("session:compress", {
-                    "platform": agent.platform or "",
-                    "session_id": agent.session_id,
-                    "old_session_id": _old_sid or "",
-                    "in_place": in_place,
-                    "compression_count": agent.context_compressor.compression_count,
-                })
-            except Exception as e:
-                logger.debug("event_callback error on session:compress: %s", e)
-
         # Surface the compaction mode to the caller (run_conversation / gateway)
         # via a rotation-independent flag. The gateway uses this — NOT an
         # id-change diff — to re-baseline transcript handling (history_offset=0 +
@@ -4227,10 +4211,54 @@ def compress_context(
             system_prompt=new_system_prompt or "",
             tools=agent.tools or None,
         )
+        try:
+            _previous_provider_prompt_tokens = int(
+                getattr(agent.context_compressor, "last_real_prompt_tokens", 0) or 0
+            )
+        except (TypeError, ValueError):
+            _previous_provider_prompt_tokens = 0
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+
+        # Emit session:compress only after both local request estimates are known.
+        # Hooks can now report the boundary immediately without mistaking the
+        # prior provider response or message-text chars/4 for current occupancy.
+        # The first provider response after this boundary emits the separate
+        # session:compress:verified event from conversation_loop.py.
+        if getattr(agent, "event_callback", None):
+            try:
+                agent.event_callback(
+                    "session:compress",
+                    {
+                        "platform": agent.platform or "",
+                        "session_id": agent.session_id,
+                        "old_session_id": _old_sid or "",
+                        "in_place": in_place,
+                        "compression_count": agent.context_compressor.compression_count,
+                        "trigger_estimated_tokens": int(approx_tokens or 0),
+                        "rewritten_estimated_tokens": int(_compressed_est or 0),
+                        "previous_provider_prompt_tokens": max(
+                            0, _previous_provider_prompt_tokens
+                        ),
+                        "threshold_tokens": int(
+                            getattr(
+                                agent.context_compressor, "threshold_tokens", 0
+                            )
+                            or 0
+                        ),
+                        "context_window_tokens": int(
+                            getattr(agent.context_compressor, "context_length", 0)
+                            or 0
+                        ),
+                        "pre_message_count": int(_pre_msg_count),
+                        "post_message_count": int(len(compressed)),
+                        "estimate_kind": "local_request_estimate",
+                    },
+                )
+            except Exception as e:
+                logger.debug("event_callback error on session:compress: %s", e)
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
         # leave this false, so unrelated later usage cannot be charged to an

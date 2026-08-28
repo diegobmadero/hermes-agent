@@ -39,6 +39,9 @@ class _Agent:
     def _build_system_prompt(self, system_message):
         return system_message
 
+    def _serialize_todo_state(self):
+        return None
+
     def commit_memory_session(self, _messages):
         pass
 
