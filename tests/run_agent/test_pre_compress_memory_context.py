@@ -113,7 +113,13 @@ def test_legacy_engine_receives_only_supported_compression_arguments():
         force=True,
     )
 
-    assert len(compressed) == 2
+    # The engine returns two adjacent user turns. The durable-boundary repair
+    # (compaction continuity work) enforces strict role alternation on the
+    # persisted projection, so they merge into one — upstream's verbatim-shape
+    # expectation contradicts the repo's own alternation invariant and was
+    # adapted accordingly.
+    assert len(compressed) == 1
+    assert compressed[0]["content"] == "message 0\n\nmessage 5"
     assert calls == [100_000]
 
 

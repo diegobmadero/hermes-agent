@@ -89,6 +89,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     open: request => ipcRenderer.invoke('hermes:hud:open', request),
     close: () => ipcRenderer.invoke('hermes:hud:close'),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
+    beginMove: () => ipcRenderer.send('hermes:hud:begin-move'),
+    endMove: () => ipcRenderer.send('hermes:hud:end-move'),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),
     setWorkspaceTransfer: transferring => ipcRenderer.send('hermes:hud:workspace-transfer', transferring),
     setBounds: bounds => ipcRenderer.send('hermes:hud:set-bounds', bounds),
@@ -185,6 +187,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setLaunchMode: mode => ipcRenderer.invoke('hermes:connections:set-launch-mode', mode),
     setLastUsed: id => ipcRenderer.invoke('hermes:connections:set-last-used', id),
     test: id => ipcRenderer.invoke('hermes:connections:test', id),
+    updateManaged: id => ipcRenderer.invoke('hermes:connections:update-managed', id),
     // Fan out `hermes update` to every eligible registered connection.
     // Optional excludeIds skips rows the caller updates through another path.
     updateAll: options => ipcRenderer.invoke('hermes:connections:update-all', options),
@@ -214,6 +217,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
+    remember: name => ipcRenderer.invoke('hermes:profile:remember', name),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
   },
   api: request => ipcRenderer.invoke('hermes:api', request),
@@ -267,6 +271,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
   reachPreviewUrl: url => ipcRenderer.invoke('hermes:preview:reach', url),
+  setActiveConnectionRoute: route => ipcRenderer.send('hermes:connection:active-route', route),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
   resolveFavicon: url => ipcRenderer.invoke('hermes:resolveFavicon', url),
   sanitizeWorkspaceCwd: cwd => ipcRenderer.invoke('hermes:workspace:sanitize', cwd),
