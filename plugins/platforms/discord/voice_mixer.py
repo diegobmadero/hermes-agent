@@ -75,6 +75,105 @@ class MixerChild:
         return samples
 
 
+class StreamingSpeechChild:
+    """A speech child whose PCM grows while the TTS provider streams.
+
+    Unlike :class:`MixerChild` (one complete clip known up front), this child
+    is fed 48 kHz / stereo / s16le PCM incrementally by the gateway's
+    streaming-TTS consumer while the LLM is still generating, so playback
+    starts on the first synthesised sentence instead of after the whole reply.
+
+    Threading: ``append`` / ``finish`` / ``abort`` are called from the
+    asyncio event-loop thread; :meth:`read_frame` is called from discord.py's
+    audio sender thread (under the mixer's lock).  The child's own lock
+    guards the buffer; it never takes the mixer's lock, so the lock order is
+    always mixer → child and cannot deadlock.
+
+    Starvation (producer slower than realtime) yields silence frames instead
+    of finishing, so a mid-sentence provider stall does not end the speech
+    segment early and re-trigger ducking / completion bookkeeping.
+    """
+
+    __slots__ = (
+        "name", "gain", "is_speech", "fade_frames", "_fade_done",
+        "_buf", "_eof", "_aborted", "_lock",
+    )
+
+    def __init__(
+        self,
+        name: str = "speech-stream",
+        *,
+        gain: float = 1.0,
+        fade_in_ms: int = 40,
+    ):
+        self.name = name
+        self.gain = float(gain)
+        self.is_speech = True
+        self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
+        self._fade_done = 0
+        self._buf = bytearray()
+        self._eof = False
+        self._aborted = False
+        self._lock = threading.Lock()
+
+    def append(self, pcm: bytes) -> None:
+        """Append mixer-format PCM (48 kHz stereo s16le). No-op after abort."""
+        if not pcm:
+            return
+        with self._lock:
+            if self._aborted or self._eof:
+                return
+            self._buf.extend(pcm)
+
+    def finish(self) -> None:
+        """Signal end-of-stream: the buffered tail plays out, then done."""
+        with self._lock:
+            self._eof = True
+
+    def abort(self) -> None:
+        """Drop buffered and future audio immediately (idempotent)."""
+        with self._lock:
+            self._aborted = True
+            self._buf.clear()
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self._aborted or (self._eof and not self._buf)
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        """Return the next 20 ms frame as a float32 ndarray.
+
+        ``None`` ends the child (only after abort, or EOF + drained buffer).
+        While starving mid-stream it returns silence so the mixer keeps the
+        speech segment (and ambient duck) alive until more audio lands.
+        """
+        with self._lock:
+            if self._aborted:
+                return None
+            np = _require_numpy()
+            if len(self._buf) >= FRAME_SIZE:
+                raw = bytes(self._buf[:FRAME_SIZE])
+                del self._buf[:FRAME_SIZE]
+            elif self._eof and self._buf:
+                raw = bytes(self._buf) + b"\x00" * (FRAME_SIZE - len(self._buf))
+                self._buf.clear()
+            elif self._eof:
+                return None
+            else:
+                # Starving: producer hasn't caught up to playback realtime.
+                return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+        gain = self.gain
+        if self.fade_frames and self._fade_done < self.fade_frames:
+            self._fade_done += 1
+            gain *= self._fade_done / self.fade_frames
+        if gain != 1.0:
+            samples = samples * gain
+        return samples
+
+
 class VoiceMixer(discord.AudioSource):
     """Continuous ``discord.AudioSource`` mixing N children: :meth:`set_ambient` installs the
     looping idle bed, :meth:`play_speech` layers a one-shot clip over it (ducking the bed).
@@ -113,6 +212,22 @@ class VoiceMixer(discord.AudioSource):
             self._speech.append(MixerChild(
                 pcm, gain=self._speech_gain if gain is None else float(gain), fade_in_ms=fade_in_ms,
             ))
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+
+    def play_speech_stream(self, child: "StreamingSpeechChild") -> None:
+        """Attach a streaming speech child (grows while the provider streams).
+
+        Same ducking semantics as :meth:`play_speech`; the child is dropped
+        by :meth:`read` once it reports finished (abort, or EOF + drained).
+        """
+        with self._lock:
+            if self._closed:
+                child.abort()
+                return
+            self._speech.append(child)
             self._speech_active = True
             self._duck_release_left = 0
             if self._ambient is not None:
@@ -174,6 +289,61 @@ class VoiceMixer(discord.AudioSource):
             self._closed = True
             self._ambient = None
             self._speech.clear()
+
+
+# ----------------------------------------------------------------------
+# PCM helpers
+# ----------------------------------------------------------------------
+
+def resample_to_mixer_pcm(
+    data: bytes,
+    sample_rate: int,
+    channels: int,
+    state: Optional[bytearray] = None,
+) -> bytes:
+    """Convert one s16le PCM chunk to the mixer format (48 kHz stereo s16le).
+
+    The streaming TTS providers emit 24 kHz mono s16le; the mixer speaks
+    Discord-native 48 kHz stereo.  Linear interpolation (numpy) is used for
+    the rate change and the channel count is normalised (stereo downmixes to
+    mono first, then the mono signal is duplicated to both ears).
+
+    ``state`` is an optional caller-owned bytearray carrying the leftover
+    odd byte when a provider chunk splits a 16-bit sample; pass the same
+    object on every call of one stream.  (All current streamers send
+    sample-aligned chunks, but the wire format does not guarantee it.)
+    """
+    if state is not None:
+        data = bytes(state) + data
+        state.clear()
+    if len(data) % 2:
+        if state is not None:
+            state.extend(data[-1:])
+        data = data[:-1]
+    if not data:
+        return b""
+
+    if sample_rate == SAMPLE_RATE and channels == CHANNELS:
+        return data
+
+    np = _require_numpy()
+    samples = np.frombuffer(data, dtype=np.int16)
+    if channels == 2:
+        # Downmix to mono before resampling so the rate change runs once.
+        samples = samples.reshape(-1, 2).mean(axis=1)
+    samples = samples.astype(np.float32)
+
+    if sample_rate != SAMPLE_RATE and len(samples) >= 2:
+        n_out = max(1, round(len(samples) * SAMPLE_RATE / sample_rate))
+        x_in = np.arange(len(samples), dtype=np.float64)
+        # Position-based mapping: output sample j reads the input at the
+        # instant it corresponds to (j * 0.5 for 24k -> 48k).
+        x_out = np.arange(n_out, dtype=np.float64) * (sample_rate / SAMPLE_RATE)
+        samples = np.interp(x_out, x_in, samples)
+
+    stereo = np.repeat(samples[:, None], CHANNELS, axis=1).reshape(-1)
+    np.clip(stereo, -32768, 32767, out=stereo)
+    return stereo.astype(np.int16).tobytes()
 
 
 def decode_to_pcm(path: str, *, timeout: float = 30.0) -> Optional[bytes]:
