@@ -743,7 +743,7 @@ Hermes Agent supports Discord voice messages:
 
 - **Incoming voice messages** are automatically transcribed using the configured STT provider: local `faster-whisper` (no key), Groq Whisper (`GROQ_API_KEY`), or OpenAI Whisper (`VOICE_TOOLS_OPENAI_KEY`).
 - **Text-to-speech**: Use `/voice tts` to have the bot send spoken audio responses alongside text replies.
-- **Discord voice channels**: Hermes can also join a voice channel, listen to users speaking, and talk back in the channel.
+- **Discord voice channels**: Hermes can also join a voice channel, listen to users speaking, and talk back in the channel. When the configured TTS provider supports chunked streaming (`xai`, `elevenlabs`, `openai`, or `gemini`), voice-channel replies are synthesised and played sentence by sentence while the model is still generating instead of waiting for the full reply — first audio typically starts with the first sentence. Providers without a chunked API keep the whole-file behaviour.
 
 For the full setup and operational guide, see:
 - [Voice Mode](/user-guide/features/voice-mode)
@@ -779,7 +779,7 @@ Notes:
 - The acknowledgement fires at most once per turn, only when the bot is in a voice channel and the mixer is active. It uses your configured TTS provider.
 - `ambient_path` accepts any file `ffmpeg` can decode; it's looped seamlessly. Leave it empty to use the built-in synthesised pad (no asset needed).
 - All settings live in `config.yaml` (not `.env`) — they're behavioral, not secrets.
-- When `voice_fx.enabled` is `false`, voice playback uses the original one-shot path and nothing changes.
+- When `voice_fx.enabled` is `false` there is no ambient bed or verbal ack, but voice replies still stream sentence-by-sentence (through a bare mixer) whenever the TTS provider has a chunked API; with any other provider, playback uses the original one-shot path and nothing changes.
 
 
 ## Forum Channels
