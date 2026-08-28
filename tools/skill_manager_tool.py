@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -676,6 +677,28 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return _skills_dir() / name
 
 
+def _iter_skill_md(skills_dir: Path):
+    """Yield ``SKILL.md`` paths under *skills_dir*, descending into symlinked
+    package directories.
+
+    ``pathlib.Path.rglob`` does not follow directory symlinks, so skill
+    packages exposed through symlinks — the documented layout for
+    source-repo-owned skills in a shared library — are invisible to
+    ``skill_manage`` even though ``skill_view`` resolves them fine.
+    ``os.walk(followlinks=True)`` descends into them; a realpath guard
+    dedupes aliased packages and breaks stray self-referential links.
+    """
+    seen: set = set()
+    for dirpath, dirnames, filenames in os.walk(skills_dir, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        if "SKILL.md" in filenames:
+            yield Path(dirpath) / "SKILL.md"
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
@@ -688,7 +711,7 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        for skill_md in _iter_skill_md(skills_dir):
             if is_excluded_skill_path(skill_md):
                 continue
             if skill_md.parent.name == name:
@@ -827,7 +850,7 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         try:
-            for skill_md in skills_dir.rglob("SKILL.md"):
+            for skill_md in _iter_skill_md(skills_dir):
                 if is_excluded_skill_path(skill_md):
                     continue
                 if skill_md.parent.name == name:
