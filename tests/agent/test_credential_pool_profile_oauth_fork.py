@@ -450,3 +450,25 @@ def test_heal_is_a_noop_in_classic_mode(fleet):
     before = (fleet["root"] / "auth.json").read_text()
     assert heal_forked_single_use_oauth_grants("anthropic") is None
     assert (fleet["root"] / "auth.json").read_text() == before
+
+
+def test_heal_is_noop_when_profile_auth_json_is_symlinked_to_root(fleet):
+    """Profiles whose auth.json is a symlink to the root store share ONE file.
+
+    Without a guard, the heal matches every "profile" row against its root
+    counterpart (they are the same rows), then "strips the profile copy" —
+    deleting root's only grant. The heal must recognize the shared file and
+    stand down.
+    """
+    from hermes_cli.auth import heal_forked_single_use_oauth_grants
+
+    kid = _profile(fleet, "kid")
+    (kid / "auth.json").unlink(missing_ok=True)
+    (kid / "auth.json").symlink_to(fleet["root"] / "auth.json")
+
+    before = (fleet["root"] / "auth.json").read_text()
+    fleet["use"](kid)
+    assert heal_forked_single_use_oauth_grants("anthropic") is None
+    assert (fleet["root"] / "auth.json").read_text() == before
+    rows = fleet["rows"](fleet["root"])
+    assert rows and rows[0]["id"] == "abc123"
