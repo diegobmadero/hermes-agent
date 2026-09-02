@@ -1418,6 +1418,35 @@ def _cache_mcp_audio_block(block) -> str:
     return f"MEDIA:{audio_path}"
 
 
+def _render_mcp_dropped_block_notice(block, block_type: str) -> str:
+    """Render an inline notice for an unsupported MCP content block.
+
+    Ported from MoonshotAI/kimi-code#3227: silently dropping a block leaves
+    the model unaware content went missing, with no way to recover it. The
+    notice carries whatever handles the block exposes — mime type, size,
+    uri — so the agent can fetch or reason about the missing content (for
+    link-shaped blocks the uri lets it retrieve the data itself).
+    """
+    details = [f"type={block_type}"]
+    mime = mcp_field(block, "mime_type", "mimeType", None)
+    if mime:
+        details.append(f"mimeType={mime}")
+    uri = getattr(block, "uri", None) or getattr(
+        getattr(block, "resource", None), "uri", None
+    )
+    if uri:
+        details.append(f"uri={uri}")
+    for size_attr in ("size", "sizeInBytes"):
+        size = getattr(block, size_attr, None)
+        if isinstance(size, int):
+            details.append(f"size={size}")
+            break
+    name = getattr(block, "name", None)
+    if name and isinstance(name, str):
+        details.append(f"name={name}")
+    return f"[MCP content dropped: unsupported block ({', '.join(details)})]"
+
+
 def _render_mcp_resource_block(block, server_name: str = "") -> str:
     """Render an MCP ``ResourceLink`` or ``EmbeddedResource`` block as text.
 
@@ -6611,17 +6640,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Hermes' MEDIA tag + cache_image_from_bytes) was the cleaner of
             # the two — plugs into existing infrastructure.
             parts: List[str] = []
+            # Count only *real* rendered content toward the
+            # content-vs-structuredContent arbitration below — drop notices
+            # for unsupported block types are appended to ``parts`` so the
+            # model knows content went missing, but they must not suppress
+            # a structuredContent fallback on their own.
+            usable_parts = 0
             for block in (result.content or []):
                 if hasattr(block, "text") and block.text:
                     parts.append(strip_unicode_tags(block.text))
+                    if block.text.strip():
+                        # Whitespace-only text renders but is not usable
+                        # content for arbitration purposes (kimi-code#3234).
+                        usable_parts += 1
                     continue
                 image_tag = _cache_mcp_image_block(block)
                 if image_tag:
                     parts.append(image_tag)
+                    usable_parts += 1
                     continue
                 audio_tag = _cache_mcp_audio_block(block)
                 if audio_tag:
                     parts.append(audio_tag)
+                    usable_parts += 1
                     continue
                 # ResourceLink / EmbeddedResource blocks (PDFs, archives,
                 # office docs, ...). Previously these were silently dropped,
@@ -6630,6 +6671,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 resource_text = _render_mcp_resource_block(block, server_name)
                 if resource_text:
                     parts.append(resource_text)
+                    usable_parts += 1
                     continue
                 # Benign empty renders (empty text blocks, empty text
                 # resources, audio in a process without the gateway cache)
@@ -6646,16 +6688,31 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         "MCP %s: dropping unsupported content block type %r",
                         server_name, block_type,
                     )
+                    # Surface the drop to the MODEL, not just the log
+                    # (ported from MoonshotAI/kimi-code#3227): a silent
+                    # drop leaves the agent believing the tool returned
+                    # less than it did, with no way to recover. Carry
+                    # whatever handles the block exposes (mime, uri) so
+                    # the agent can fetch the content itself.
+                    parts.append(_render_mcp_dropped_block_notice(block, block_type))
             text_result = "\n".join(parts) if parts else ""
 
             # Hard-cap pathological payloads before they propagate (#56059);
             # ordinary large results pass untouched to the spillover layer.
             text_result = _truncate_mcp_text_result(text_result)
 
-            # Combine content + structuredContent when both are present.
-            # MCP spec: content is model-oriented (text), structuredContent
-            # is machine-oriented (JSON metadata).  For an AI agent, content
-            # is the primary payload; structuredContent supplements it.
+            # content and structuredContent are ALTERNATIVES — never both
+            # forwarded (ported from MoonshotAI/kimi-code#3234). Spec-following
+            # servers already render their data into content (the verbatim
+            # dual-emit SHOULD, or a faithful human reorganisation), so
+            # forwarding both sent the same information to the model twice.
+            # content wins whenever it rendered anything usable; there is no
+            # reliable signal that the structured payload is richer than what
+            # the server put in content (semantic equality misses faithful
+            # reorganisations, size ratios misjudge both directions), so no
+            # heuristic is attempted. structuredContent fills in only when
+            # the content blocks rendered effectively empty, which keeps
+            # structuredContent-only servers working.
             #
             # Server-level `_meta` is also surfaced (ported from
             # MoonshotAI/kimi-code#2596): servers return namespaced metadata
@@ -6682,6 +6739,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if _structured_json is not None and len(_structured_json) > _MCP_HARD_RESULT_CAP_CHARS:
                     structured = _truncate_mcp_text_result(_structured_json)
             meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
+            # Arbitration (kimi-code#3234): forward structuredContent only
+            # when the content blocks rendered nothing usable. Drop notices
+            # appended above do not count as usable content.
+            if structured is not None and usable_parts > 0:
+                structured = None
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
                 if text_result:
@@ -8201,7 +8263,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -8209,6 +8271,19 @@ def discover_mcp_tools() -> List[str]:
 
     Idempotent for already-connected servers. If some servers failed on a
     previous call, only the missing ones are retried.
+
+    Args:
+        allowed_mcp_names: If provided, only spawn MCP servers whose names
+            appear in this list. Built-in toolset names (e.g. "web", "memory")
+            in the list are ignored — only matching MCP-server names trigger
+            spawning. Pass ``None`` (default) to spawn all configured servers
+            for backwards compatibility.
+
+            This is used by ``hermes -z -t <toolsets>`` to skip cold-starting
+            MCP subprocesses that the caller doesn't need — saving 10-60s of
+            startup wait per non-needed server. The full set of MCP names is
+            still discoverable via the ``-t`` validation path; this filter
+            only affects which servers are actually started.
 
     Returns:
         List of all registered MCP tool names.
@@ -8218,8 +8293,28 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("No MCP servers configured")
         return []
 
+    if allowed_mcp_names is not None:
+        # Filter by MCP-server-name match. Built-in toolset names that aren't
+        # MCP servers will simply not match — that's fine; they don't need
+        # MCP spawning anyway.
+        allowed_set = {str(n) for n in allowed_mcp_names}
+        filtered = {name: cfg for name, cfg in servers.items() if name in allowed_set}
+        skipped_count = len(servers) - len(filtered)
+        if skipped_count:
+            logger.debug(
+                "MCP discovery filter: spawning %d/%d configured server(s) per --toolsets filter "
+                "(skipped: %s)",
+                len(filtered), len(servers),
+                ",".join(sorted(set(servers) - set(filtered))),
+            )
+        servers = filtered
+        if not servers:
+            logger.debug("No MCP servers in --toolsets filter; skipping MCP load entirely")
+            return []
+
     # SDK import is deferred to HERE so a config with zero MCP servers (the
-    # default) never pays the ~260ms `mcp` import on CLI startup.
+    # default) — or a -t/--toolsets filter that keeps none — never pays the
+    # ~260ms `mcp` import on CLI startup.
     if not _ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
