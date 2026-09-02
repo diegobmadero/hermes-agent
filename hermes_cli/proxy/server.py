@@ -7,8 +7,17 @@ response bytes are forwarded unmodified. Non-streaming responses are buffered so
 upstream body failures can still return a precise proxy error; streaming/SSE
 responses remain streamed.
 
-The server does not log or transform request/response bodies. It is a
-credential-attaching forwarder with bounded lifecycle telemetry.
+One narrow SSE compatibility shim applies after a *clean* upstream EOF:
+when a ``text/event-stream`` response carries a terminal ``finish_reason``
+or ``lastOne: true`` but omits the OpenAI ``data: [DONE]`` sentinel, the
+proxy appends a single ``[DONE]`` frame. It never rewrites earlier frames,
+never duplicates an upstream ``[DONE]``, and never synthesizes ``[DONE]``
+after an error event or a mid-stream interrupt (see
+:mod:`hermes_cli.proxy.sse_done`, issue #90848).
+
+Otherwise the server does not log, mediate, or transform request/response
+bodies — it is a credential-attaching forwarder with bounded lifecycle
+telemetry.
 """
 
 from __future__ import annotations
@@ -32,6 +41,11 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.sse_done import (
+    DONE_SSE_FRAME,
+    SseDoneTracker,
+    content_type_is_sse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -456,14 +470,29 @@ def create_app(
             headers=response_headers,
         )
         bytes_out = 0
+        # Track SSE terminal markers so we can append a missing [DONE]
+        # after clean EOF without rewriting any earlier frames. Initialized
+        # before the try so every except clause can mark interruptions.
+        done_tracker: Optional[SseDoneTracker] = None
+        if content_type_is_sse(upstream_resp.headers):
+            done_tracker = SseDoneTracker()
         try:
             await resp.prepare(request)
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     bytes_out += len(chunk)
+                    if done_tracker is not None:
+                        done_tracker.feed(chunk)
                     await resp.write(chunk)
+            if done_tracker is not None and done_tracker.should_append_done():
+                try:
+                    await resp.write(DONE_SSE_FRAME)
+                except Exception as exc:  # client hung up at EOF — harmless
+                    logger.debug("proxy: DONE append skipped: %s", exc)
             await resp.write_eof()
         except asyncio.CancelledError:
+            if done_tracker is not None:
+                done_tracker.mark_interrupted()
             logger.info(
                 "event=proxy_request_failed request_id=%s provider=%s "
                 "stage=response_stream code=client_cancelled status=%d "
@@ -476,6 +505,8 @@ def create_app(
             )
             raise
         except aiohttp.ClientError as exc:
+            if done_tracker is not None:
+                done_tracker.mark_interrupted()
             logger.warning("proxy: streaming interrupted: %s", exc)
             logger.info(
                 "event=proxy_request_failed request_id=%s provider=%s "
@@ -489,9 +520,26 @@ def create_app(
             )
             return resp
         except ConnectionError:
+            if done_tracker is not None:
+                done_tracker.mark_interrupted()
             logger.info(
                 "event=proxy_request_failed request_id=%s provider=%s "
                 "stage=response_stream code=client_disconnected status=%d "
+                "duration_ms=%d bytes_out=%d",
+                request_id,
+                adapter.name,
+                upstream_resp.status,
+                duration_ms(),
+                bytes_out,
+            )
+            return resp
+        except OSError as exc:
+            if done_tracker is not None:
+                done_tracker.mark_interrupted()
+            logger.warning("proxy: streaming interrupted: %s", exc)
+            logger.info(
+                "event=proxy_request_failed request_id=%s provider=%s "
+                "stage=response_stream code=stream_interrupted status=%d "
                 "duration_ms=%d bytes_out=%d",
                 request_id,
                 adapter.name,

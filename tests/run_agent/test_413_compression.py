@@ -473,23 +473,19 @@ class TestPreflightCompression:
                 approx_tokens=1234,
             )
 
-        # The compressor returned only the user-role summary; the durable
-        # boundary now canonicalizes the summary→user pair immediately into
-        # the composite carrier (compaction continuity work) instead of
-        # publishing two adjacent user turns and deferring to the next
-        # API-call repair. Assert the carrier contract, not the legacy shape.
-        assert len(compressed) == 1
-        carrier = compressed[0]
-        assert carrier["role"] == "user"
-        parts = carrier["content"]
-        assert isinstance(parts, list)
-        texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-        joined = "\n".join(texts)
-        assert SUMMARY_PREFIX in joined
-        assert "Previous conversation" in joined
-        assert "hello" in texts
-        assert new_system_prompt == "You are helpful."
-        build_prompt.assert_not_called()
+        # The compressor returned only the user-role summary; a summary
+        # message no longer satisfies the human-anchor check, so the real
+        # user turn is restored after it (repair merges the pair
+        # summary-first before the next API call).
+        assert compressed == [
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+            {"role": "user", "content": "hello", _DB_PERSISTED_MARKER: True},
+        ]
+        # Post-#98426 the commit boundary ALWAYS runs the live builder;
+        # its output differs from the cached prompt here, so the rebuilt
+        # prompt wins.
+        assert new_system_prompt == "new system prompt"
+        build_prompt.assert_called_once()
         assert events == [
             ("lifecycle", COMPACTION_STATUS),
             ("compress", "started"),
@@ -536,7 +532,12 @@ class TestPreflightCompression:
         assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
-        """A memory reload without new injected text must keep the cache prefix."""
+        """A byte-equal rebuild must keep the EXACT cached prompt object.
+
+        Post-#98426 the commit boundary always runs the live builder; when
+        its output is byte-identical to the stored prompt, the ORIGINAL
+        string object is kept (KV/prefix caches keyed on identity survive).
+        """
         agent.compression_enabled = False
         agent._memory_enabled = True
         agent._user_profile_enabled = False
@@ -554,7 +555,11 @@ class TestPreflightCompression:
                 "compress",
                 return_value=[{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}],
             ),
-            patch.object(agent, "_build_system_prompt") as build_prompt,
+            patch.object(
+                agent,
+                "_build_system_prompt",
+                return_value="cached system prompt\n\n<memory>same facts</memory>",
+            ) as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
                 [{"role": "user", "content": "hello"}],
@@ -564,7 +569,7 @@ class TestPreflightCompression:
 
         assert new_system_prompt is agent._cached_system_prompt
         assert new_system_prompt == "cached system prompt\n\n<memory>same facts</memory>"
-        build_prompt.assert_not_called()
+        build_prompt.assert_called_once()
         memory_store.load_from_disk.assert_called_once()
 
 

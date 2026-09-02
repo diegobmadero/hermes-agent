@@ -496,6 +496,134 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_clarify_snapshot_replays_and_proxies_batch_answers(monkeypatch):
+    """A host-owned clarify survives activation and receives its UI answers."""
+    class _Supervisor:
+        def __init__(self):
+            self.responses = []
+
+        def respond(self, sid, params, *, timeout=15.0):
+            self.responses.append((sid, dict(params), timeout))
+            remaining = ["q1"] if params.get("question_id") == "q0" else []
+            return {"type": "respond.ack", "response": {"result": {"status": "ok", "remaining": remaining}}}
+
+    sid = "host-clarify"
+    supervisor = _Supervisor()
+    session = _session(agent=None, agent_ready=threading.Event(), _compute_host_active=True)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor)
+    monkeypatch.setattr(server, "write_json", lambda _message: True)
+
+    try:
+        server._relay_compute_host_rpc(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "clarify.request",
+                    "session_id": sid,
+                    "payload": {
+                        "request_id": "host-request",
+                        "questions": [
+                            {"qid": "q0", "question": "First?", "choices": ["a"]},
+                            {"qid": "q1", "question": "Second?", "choices": ["b"]},
+                        ],
+                    },
+                },
+            }
+        )
+
+        activated = server._live_session_payload(sid, session)
+        assert activated["pending_clarify"]["request_id"] == "host-request"
+
+        response = server.handle_request(
+            {
+                "id": "clarify-q0",
+                "method": "clarify.respond",
+                "params": {"request_id": "host-request", "question_id": "q0", "answer": "a"},
+            }
+        )
+
+        assert response["result"] == {"status": "ok", "remaining": ["q1"]}
+        assert supervisor.responses == [
+            (sid, {"request_id": "host-request", "question_id": "q0", "answer": "a"}, 15.0)
+        ]
+        replayed = server._live_session_payload(sid, session)["pending_clarify"]
+        assert replayed["answers"] == {"q0": "a"}
+
+        final_response = server.handle_request(
+            {
+                "id": "clarify-q1",
+                "method": "clarify.respond",
+                "params": {"request_id": "host-request", "question_id": "q1", "answer": "b"},
+            }
+        )
+
+        assert final_response["result"] == {"status": "ok", "remaining": []}
+        assert "pending_clarify" not in server._live_session_payload(sid, session)
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_compute_host_interrupt_forwards_when_parent_running_mirror_is_stale(monkeypatch):
+    """The host, not the parent's mirrored running flag, owns interruption."""
+    interrupted = []
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    sid = "host-stale-running"
+    server._sessions[sid] = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        _compute_host_active=True,
+        running=False,
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        response = server.handle_request(
+            {"id": "interrupt", "method": "session.interrupt", "params": {"session_id": sid}}
+        )
+        assert response["result"] == {"status": "interrupted", "turn_isolation": True}
+        assert interrupted == [(sid, "interrupt-interrupt")]
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_compute_host_interrupt_skips_lazy_session_with_no_hosted_turn(monkeypatch):
+    """A lazy session that never submitted a hosted turn must not spawn a host.
+
+    ``HostSupervisor.interrupt()`` calls ``start()``, so forwarding the
+    interrupt unconditionally would launch a compute-host child just to
+    deliver an interrupt for a session with no work in it.
+    """
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):  # pragma: no cover - must not run
+            raise AssertionError("interrupt must not be forwarded for idle lazy sessions")
+
+    sid = "lazy-idle"
+    session = _session(
+        agent_ready=threading.Event(),
+        running=False,
+    )
+    session["agent"] = None  # _session() substitutes a namespace for None
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        response = server.handle_request(
+            {"id": "interrupt", "method": "session.interrupt", "params": {"session_id": sid}}
+        )
+        assert response["result"] == {"status": "interrupted", "turn_isolation": True}
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
@@ -3809,7 +3937,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
 
     monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
     monkeypatch.setattr(server, "_profile_home", lambda _profile: profile_home)
-    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
@@ -3873,7 +4001,7 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
 
     import tools.terminal_tool as terminal_tool
 
-    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
     monkeypatch.setattr(terminal_tool, "cleanup_vm", lambda _key: None)
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
@@ -5652,6 +5780,147 @@ def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     server._schedule_ws_orphan_reap("any-sid")
     assert fired["timer"] is False
+
+
+def test_ws_orphan_reap_defers_running_turn_with_fresh_activity(monkeypatch):
+    """#98028/#100325: a client-absent turn whose activity clock is fresh is
+    NOT interrupted — it keeps running detached and the reaper re-polls at the
+    grace interval. Once the clock goes stale the wedged-turn interrupt fires,
+    and after the turn settles the session is reaped as before."""
+    callbacks = []
+    delays = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, delay, callback):
+            delays.append(delay)
+            callbacks.append(callback)
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    activity = {"seconds_since_activity": 1.0}
+    agent = types.SimpleNamespace(
+        get_activity_summary=lambda: dict(activity),
+        interrupt=lambda message=None: interrupted.append("interrupted"),
+    )
+
+    class _DeadThread:
+        def is_alive(self):
+            return False
+
+    session = _session(
+        agent=agent,
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_DeadThread(),
+    )
+    server._sessions["fresh-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 300.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("fresh-sid")
+
+        # Two grace cycles with fresh activity: no interrupt, reschedule at
+        # the GRACE interval (not the 1s interrupt-settle poll).
+        for _ in range(2):
+            callbacks.pop(0)()
+            assert interrupted == []
+            assert not session.get("_client_gone_interrupt_requested")
+            assert delays[-1] == server._WS_ORPHAN_REAP_GRACE_S
+            assert "fresh-sid" in server._sessions
+
+        # Activity goes stale (turn wedged) -> interrupt fires on next poll.
+        activity["seconds_since_activity"] = 301.0
+        callbacks.pop(0)()
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
+
+        # Turn settles -> reap proceeds exactly as today.
+        session["running"] = False
+        callbacks.pop(0)()
+        assert "fresh-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop("fresh-sid", None)
+
+
+def test_ws_orphan_activity_gate_zero_restores_interrupt_at_grace(monkeypatch):
+    """ws_orphan_activity_stale_s=0 opts out: fresh activity no longer defers
+    the client-gone interrupt (pre-#98028 behaviour)."""
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    agent = types.SimpleNamespace(
+        get_activity_summary=lambda: {"seconds_since_activity": 0.5},
+        interrupt=lambda message=None: interrupted.append("interrupted"),
+    )
+    session = _session(
+        agent=agent,
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["optout-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 0.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    try:
+        server._schedule_ws_orphan_reap("optout-sid")
+        callbacks.pop(0)()
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
+    finally:
+        server._sessions.pop("optout-sid", None)
+
+
+def test_ws_orphan_activity_gate_unreadable_summary_stays_eligible(monkeypatch):
+    """A broken/opaque activity summary must fail CLOSED (not fresh): the
+    wedged-turn interrupt-at-grace safety net is preserved."""
+
+    def _boom():
+        raise RuntimeError("summary unavailable")
+
+    agent = types.SimpleNamespace(get_activity_summary=_boom)
+    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 300.0)
+    assert server._ws_orphan_turn_activity_is_fresh({"agent": agent}) is False
+    # No agent / no summary method: same conservative answer.
+    assert server._ws_orphan_turn_activity_is_fresh({"agent": None}) is False
+    assert (
+        server._ws_orphan_turn_activity_is_fresh(
+            {"agent": types.SimpleNamespace()}
+        )
+        is False
+    )
+    # Never-stamped clock (None) is not fresh either.
+    agent2 = types.SimpleNamespace(
+        get_activity_summary=lambda: {"seconds_since_activity": None}
+    )
+    assert server._ws_orphan_turn_activity_is_fresh({"agent": agent2}) is False
 
 
 def test_init_session_fires_reset_hook(monkeypatch):
@@ -7644,7 +7913,7 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr("hermes_state.SessionDB", _ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", _ProfileDB)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
     server._ensure_session_db_row(
@@ -7654,6 +7923,28 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
     assert created and created[0]["key"] == "k1"
     assert created[0]["profile_name"] == "mlperf"
     assert created[0]["db_path"] == profile_home / "state.db"
+
+
+def test_ensure_session_db_row_stamps_launch_profile_name(monkeypatch):
+    """A launch-profile session row is stamped with the ACTUAL profile name,
+    never NULL. NULL-as-launch-profile rows vanish from the desktop sidebar
+    (profile-keyed matching) and break @session:<profile>/<id> deep links, and
+    the #94724 one-shot backfill cannot keep repairing rows minted after it
+    ran (#99222)."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, **kwargs):
+            created.append({"key": key, "profile_name": kwargs.get("profile_name")})
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+
+    server._ensure_session_db_row({"session_key": "k1"})
+
+    assert created and created[0]["key"] == "k1"
+    assert created[0]["profile_name"] == "default"
 
 
 def test_session_title_clears_pending_after_persist(monkeypatch):
@@ -9463,7 +9754,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         "hermes_cli.model_selection_guards.combined_selection_warning",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("hermes_state.SessionDB", FakeDb)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", FakeDb)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_transfer_db_to_agent", barrier_transfer)
     monkeypatch.setattr(
@@ -12859,6 +13150,11 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
         assert resp.get("error") is None, f"got error: {resp.get('error')}"
         assert sess["history"] == tip_history[:2]
     finally:
+        # Release the slot the first turn claimed, as _finalize_session does in
+        # production. Popping alone leaks the lease, and the second session below
+        # uses the same session_key -- so without this the test fences itself out
+        # of its own key and never reaches the mismatch it is checking.
+        server._release_active_session_slot(sess)
         server._sessions.pop("lineage-row-sid", None)
 
     # A genuinely stale ordinal (matches neither the tip space nor the
@@ -12885,6 +13181,7 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
         assert resp.get("error") is not None
         assert resp["error"]["code"] == 4030
     finally:
+        server._release_active_session_slot(sess2)
         server._sessions.pop("lineage-row-sid-2", None)
 
 
@@ -13413,7 +13710,13 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
 def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
     """When the build itself FAILS (agent_error set when ready fires), the
     prompt must not run and the failure must reach the client as a visible
-    error event — never a silent drop."""
+    error event — never a silent drop.
+
+    prompt.submit retries a completed failed build once (fresh provider
+    resolution un-wedges sessions whose failure cause was fixed), so the
+    build stub here is a faithful failing build: it sets agent_error and
+    fires the session's CURRENT ready event (the retry installs a new one).
+    A no-op stub would leave that event unset and hang the patient wait."""
     threads = []
     emitted = []
     calls = {"run_prompt": 0}
@@ -13436,12 +13739,16 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
     session["agent_error"] = "No LLM provider configured"  # ...but failed
     server._sessions["sid"] = session
 
+    def _failing_build(sid, session):
+        session["agent_error"] = "No LLM provider configured"
+        session["agent_ready"].set()
+
     try:
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", _failing_build)
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
@@ -14268,12 +14575,77 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
             raise RuntimeError("locking protocol")
 
     fake_mod.SessionDB = _BrokenSessionDB
+
+    def _broken_shared(_db_path=None):
+        raise RuntimeError("locking protocol")
+
+    fake_mod.get_shared_session_db = _broken_shared
     monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
     monkeypatch.setattr(server, "_db", None)
     monkeypatch.setattr(server, "_db_error", None)
 
     assert server._get_db() is None
     assert server._db_error == "locking protocol"
+
+
+def test_ensure_session_db_row_false_when_store_unavailable(monkeypatch):
+    """Store unavailable → False, so prompt.submit can fail the send loudly
+    instead of streaming into a store that will never save it (#98924)."""
+    fake_mod = types.ModuleType("hermes_state")
+
+    class _BrokenSessionDB:
+        def __init__(self):
+            raise RuntimeError("utf-8 boom")
+
+    fake_mod.SessionDB = _BrokenSessionDB
+
+    def _broken_shared(_db_path=None):
+        raise RuntimeError("utf-8 boom")
+
+    fake_mod.get_shared_session_db = _broken_shared
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
+    monkeypatch.setattr(server, "_db", None)
+    monkeypatch.setattr(server, "_db_error", None)
+
+    assert server._ensure_session_db_row({"session_key": "k1"}) is False
+
+
+def test_ensure_session_db_row_true_when_row_persisted(monkeypatch):
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, **_kwargs):
+            created.append(key)
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    assert server._ensure_session_db_row({"session_key": "k1", "cwd": "/tmp"}) is True
+    assert created == ["k1"]
+
+
+def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
+    """A send with no persistable store must fail the RPC with a real error
+    (desktop maps it to a toast) instead of streaming the message into a
+    store that will never save it (#98924)."""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {}})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_db_error", "utf-8 decode failure")
+
+    server._sessions["lost-sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "lost",
+                "method": "prompt.submit",
+                "params": {"session_id": "lost-sid", "text": "will vanish"},
+            }
+        )
+    finally:
+        server._sessions.pop("lost-sid", None)
+
+    assert resp["error"]["code"] == 5072
+    assert "session storage unavailable" in resp["error"]["message"]
 
 
 @pytest.mark.real_agent_prewarm
@@ -14583,7 +14955,7 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
 
     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
 
     resp = server.handle_request(
         {
@@ -14624,7 +14996,7 @@ def test_session_most_recent_honors_params_profile(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB2)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB2)
 
     resp = server.handle_request(
         {
@@ -14684,7 +15056,7 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
 
     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "mlperf" else None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
 
     resp = server.handle_request(
         {
@@ -14751,7 +15123,7 @@ def test_session_title_uses_session_profile_db_not_launch(monkeypatch, tmp_path)
         "last_active": 1.0,
     }
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     try:
         set_resp = server.handle_request(
             {
@@ -14808,7 +15180,7 @@ def test_session_history_uses_session_profile_db(monkeypatch, tmp_path):
         "last_active": 1.0,
     }
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.history", "params": {"session_id": "sid"}}
@@ -14895,7 +15267,7 @@ def test_session_status_uses_session_profile_db(monkeypatch, tmp_path):
         "last_active": 1.0,
     }
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
@@ -14937,7 +15309,7 @@ def test_teardown_ends_session_in_profile_db(monkeypatch, tmp_path):
             seen["closed"] = True
 
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     session = {
         "session_key": "ml-sess",
         "profile_home": str(profile_home),
@@ -15030,7 +15402,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     }
     server._sessions["parent"] = parent
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
 
     def _fake_make_agent(*a, **k):
@@ -15146,7 +15518,7 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
     }
     server._sessions["parent"] = parent
     monkeypatch.setattr(server, "_get_db", lambda: ProfileDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
 
     def _fake_make_agent(*a, **k):
@@ -15263,7 +15635,7 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
     }
     server._sessions["parent"] = parent
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     monkeypatch.setattr(server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None))
     monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: FakeAgent())
     monkeypatch.setattr(server, "_set_session_context", lambda *args, **kwargs: {})
@@ -15323,7 +15695,7 @@ def test_pending_title_finalizer_uses_session_profile_db(monkeypatch, tmp_path):
             seen["closed"] = True
 
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
-    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr("hermes_state.get_shared_session_db", ProfileDB)
     session = {
         "session_key": "ml-sess",
         "pending_title": "deferred-title",
@@ -18823,6 +19195,51 @@ class _BareAgent:
     independent of the `if comp:` context-percent block."""
 
     model = "x"
+
+
+def test_get_usage_perf_readouts_present():
+    """cache_hit_pct / avg_latency_s / avg_tps mirror the classic CLI bar."""
+    from collections import deque
+
+    class _PerfAgent:
+        model = "x"
+        session_prompt_tokens = 27_873
+        session_cache_read_tokens = 24_369
+        _api_latency_history = deque([2.1, 4.3], maxlen=10)
+        _api_output_history = deque([130, 190], maxlen=10)
+
+    usage = server._get_usage(_PerfAgent())
+    assert usage["cache_hit_pct"] == 87
+    assert usage["avg_latency_s"] == 3.2
+    assert usage["avg_tps"] == 50.0  # true throughput sum(out)/sum(lat), not mean of ratios
+
+
+def test_get_usage_perf_readouts_omitted_without_data():
+    """Zero cache reads / empty history omit the keys — never fabricate 0s."""
+
+    class _ColdAgent:
+        model = "x"
+        session_prompt_tokens = 100
+        session_cache_read_tokens = 0
+
+    usage = server._get_usage(_ColdAgent())
+    assert "cache_hit_pct" not in usage
+    assert "avg_latency_s" not in usage
+    assert "avg_tps" not in usage
+
+
+def test_get_usage_perf_readouts_guard_negative_latency():
+    """Odd provider timings (negative durations seen in logs) are dropped."""
+    from collections import deque
+
+    class _WeirdAgent:
+        model = "x"
+        _api_latency_history = deque([-0.8], maxlen=10)
+        _api_output_history = deque([100], maxlen=10)
+
+    usage = server._get_usage(_WeirdAgent())
+    assert "avg_latency_s" not in usage
+    assert "avg_tps" not in usage
 
 
 def test_get_usage_includes_active_subagents(monkeypatch):
