@@ -1202,6 +1202,24 @@ _WINDOWS_BASH_SHELL_HINT = (
 )
 
 
+def _tenv_read(name: str, default: str = "") -> str:
+    """Scope-aware TERMINAL_* read (tools.terminal_scope.terminal_env).
+
+    The per-turn terminal scope installed by the multiplexing gateway carries
+    the active profile's terminal settings; a raw os.getenv would read a value
+    a previous profile's turn pinned into the process env.
+
+    Only an import failure falls back: an active refusal scope must raise —
+    swapping it for the ambient process value would defeat the fail-closed
+    boundary.
+    """
+    try:
+        from tools.terminal_scope import terminal_env
+    except ImportError:
+        return os.getenv(name, default)
+    return terminal_env(name, default)
+
+
 def _probe_remote_backend(env_type: str) -> str | None:
     """Run a tiny introspection command inside the active terminal backend.
 
@@ -1210,7 +1228,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
+    cwd_hint = _tenv_read("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
@@ -1225,6 +1243,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
+    env = None
     try:
         config = _get_env_config()
         # Build the environment the same way tools/terminal_tool.py does for a
@@ -1305,6 +1324,20 @@ def _probe_remote_backend(env_type: str) -> str | None:
         logger.debug("Backend probe failed: %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        # The probe only needs a one-shot `uname`; without teardown the
+        # backend leaves a second idle sandbox (task_id="prompt-backend-probe")
+        # running for the whole process lifetime next to the agent's own one.
+        # ssh is left alone: it has no task-scoped sandbox and its cleanup()
+        # closes a ControlMaster socket (keyed by user@host:port) shared with
+        # the agent's real environment; ControlPersist expires it anyway.
+        if env is not None and env_type != "ssh":
+            try:
+                from tools.terminal_tool import _cleanup_env
+
+                _cleanup_env(env, force_remove=True)
+            except Exception:
+                logger.debug("Backend probe cleanup failed", exc_info=True)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}
@@ -1359,7 +1392,7 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
 
     if not is_remote_backend:

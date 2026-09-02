@@ -592,6 +592,8 @@ export const zh: Translations = {
       embedsAlways: '总是',
       embedsOff: '关闭',
       embedsReset: (count: number) => `重置 ${count} 个已允许的服务`,
+      resumeLastSessionTitle: '启动时恢复上次会话',
+      resumeLastSessionDesc: '开启后，应用冷启动时重新打开最近的聊天。关闭则始终从空白新会话开始。',
       product: '产品',
       productDesc: '易读的工具活动与简洁摘要。',
       technical: '技术',
@@ -878,6 +880,9 @@ export const zh: Translations = {
       bundleOutOfSyncDesc:
         'Hermes 运行时已更新,但桌面应用本身仍是旧构建——在应用更新之前,新的界面功能(如 Bot Mode)不会显示。请运行下方的更新以重新构建应用。如果此警告仍未消除,请从最新的桌面安装程序重新安装。',
       bundleOutOfSyncAction: '获取安装程序',
+      bundleSwapPending: '重启以完成更新',
+      bundleSwapPendingDesc: '更新后的应用已安装完成，只需重启 Hermes 即可加载新版本。聊天记录和设置不会受到影响。',
+      bundleSwapPendingAction: '重启 Hermes',
       updates: '更新',
       checkNow: '立即检查',
       checking: '检查中…',
@@ -1356,7 +1361,8 @@ export const zh: Translations = {
       useAction: '使用',
       activePill: '默认',
       updateTitle: '引擎有可用更新',
-      updateDetail: (next, current) => `新的 llama.cpp 构建（${next}）可以安装——当前为 ${current}。下载期间模型仍可正常使用。`,
+      updateDetail: (next, current) =>
+        `新的 llama.cpp 构建（${next}）可以安装——当前为 ${current}。下载期间模型仍可正常使用。`,
       updateAction: '更新引擎',
       updating: '正在更新引擎…',
       upToDateTitle: '引擎已是最新',
@@ -3214,13 +3220,17 @@ export const zh: Translations = {
       resetStatusbar: '恢复默认设置',
       toggleApprovalMode: '审批',
       toggleBackendVersion: '后端版本',
+      toggleCacheHitRate: '缓存命中率',
       toggleCommandCenter: '命令中心',
       toggleContextUsage: '上下文用量',
       toggleRunningTimer: '回合计时',
       toggleSessionTimer: '会话计时',
       toggleTerminal: '终端',
+      toggleTokensPerSecond: '每秒 token 数',
       toggleVersion: '版本与更新',
       toggleWorkspace: '工作区',
+      cacheHitRateTitle: '本会话的提示缓存命中率 — 缓存 token 更便宜，越高越省',
+      tokensPerSecondTitle: '每秒输出 token 数，取最近 10 次模型调用的平均值',
       agents: '代理',
       closeAgents: '关闭代理',
       openAgents: '打开代理',
@@ -3805,10 +3815,6 @@ export const zh: Translations = {
       'composer-mentions': {
         title: '附件与命令',
         text: '输入 @ 把文件带入对话，输入 / 运行命令。'
-      },
-      'model-switch': {
-        title: '对话中随时换模型',
-        text: '模型名称就是按钮。工作性质变了就换一个。'
       },
       'local-setup': {
         title: '这台电脑可以本地运行模型',
