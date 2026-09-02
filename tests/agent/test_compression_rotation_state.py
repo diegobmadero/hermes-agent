@@ -134,30 +134,6 @@ class TestGoalMigratesOnRotation:
             goals._DB_CACHE.clear()
 
 
-class TestTodoMigratesOnRotation:
-    def test_todo_checkpoint_follows_compression_rotation(self, tmp_path: Path):
-        db = SessionDB(db_path=tmp_path / "state.db")
-        parent = "PARENT_TODO_ROT"
-        db.create_session(parent, source="cli")
-        agent = _build_agent_with_db(db, parent)
-        expected = [
-            {"id": "active", "content": "Finish the migration", "status": "in_progress"},
-            {"id": "verify", "content": "Verify the child", "status": "pending"},
-        ]
-        agent._todo_store.write(expected, merge=False)
-        agent._checkpoint_todo_state()
-
-        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
-        child = agent.session_id
-        assert child != parent
-
-        fresh = _build_agent_with_db(db, child)
-        fresh._todo_store._items = []
-        fresh._hydrate_todo_store(db.get_messages_as_conversation(child))
-        assert fresh._todo_store.read() == expected
-        db.close()
-
-
 class TestOrphanRollbackOnCreateFailure:
     def test_rolls_back_to_parent_when_child_create_fails(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")

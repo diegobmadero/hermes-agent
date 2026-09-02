@@ -2129,57 +2129,10 @@ class AIAgent:
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         persist_lock = getattr(self, "_session_persist_lock", None)
-        # Guard the todo checkpoint: flush-path tests drive this with bare
-        # SimpleNamespace agents that lack the method, and a flush must never
-        # fail because the optional continuity hook is absent.
-        _checkpoint = getattr(self, "_checkpoint_todo_state", None)
         if persist_lock is None:
-            persisted = self._flush_messages_to_session_db_unlocked(
-                messages, conversation_history
-            )
-            if persisted is True and callable(_checkpoint):
-                _checkpoint()
-        else:
-            with persist_lock:
-                persisted = self._flush_messages_to_session_db_unlocked(
-                    messages, conversation_history
-                )
-                if persisted is True and callable(_checkpoint):
-                    _checkpoint()
-        return persisted
-
-    def _serialize_todo_state(self) -> Optional[str]:
-        """Return the versioned current todo payload, or ``None`` if unavailable."""
-        todo_store = getattr(self, "_todo_store", None)
-        if todo_store is None:
-            return None
-        return json.dumps(
-            {"version": 1, "todos": todo_store.read()},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    def _checkpoint_todo_state(self) -> None:
-        """Persist the current todo list for session-owned recovery."""
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "session_id", None)
-        if session_db is None or not session_id:
-            return
-        try:
-            payload = self._serialize_todo_state()
-            if payload is None:
-                return
-            checkpoint = (session_id, payload)
-            if getattr(self, "_todo_state_checkpoint", None) == checkpoint:
-                return
-            session_db.set_meta(f"todo_state:{session_id}", payload)
-            self._todo_state_checkpoint = checkpoint
-        except Exception:
-            logger.warning(
-                "Failed to checkpoint todo state: session=%s",
-                session_id,
-                exc_info=True,
-            )
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+        with persist_lock:
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
 
     def _flush_messages_to_session_db_unlocked(
         self,
@@ -4835,76 +4788,41 @@ class AIAgent:
         seed the store without a matching canonical tool call
         (GHSA-5g4g-6jrg-mw3g).
         """
-        from tools.todo_tool import MAX_TODO_RESULT_CHARS, MAX_TODO_STATE_CHARS
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
 
-        # The session-owned checkpoint is committed atomically with compaction,
-        # so it is authoritative over protected historical tool rows. Those
-        # rows may predate a later update or clear operation.
+        # Walk history backwards to find the most recent todo tool response
         last_todo_response = None
-        checkpoint_loaded = False
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "session_id", None)
-        if session_db is not None and session_id:
+        for idx in range(len(history) - 1, -1, -1):
+            msg = history[idx]
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            # Only accept tool results paired with a prior assistant todo call.
+            if not self._tool_response_matches_todo_call(history, idx):
+                continue
+            if len(content) > MAX_TODO_RESULT_CHARS:
+                logger.warning(
+                    "Skipping oversized todo tool response during hydration: "
+                    "session=%s chars=%d",
+                    self.session_id or "none",
+                    len(content),
+                )
+                continue
+            # Quick check: todo responses contain "todos" key
+            if '"todos"' not in content:
+                continue
             try:
-                raw = session_db.get_meta(f"todo_state:{session_id}")
-                if isinstance(raw, str) and len(raw) <= MAX_TODO_STATE_CHARS:
-                    data = json.loads(raw)
-                    if (
-                        isinstance(data, dict)
-                        and data.get("version") == 1
-                        and isinstance(data.get("todos"), list)
-                    ):
-                        last_todo_response = data["todos"]
-                        checkpoint_loaded = True
-            except (json.JSONDecodeError, TypeError, ValueError):
-                logger.warning(
-                    "Skipping invalid persisted todo state during hydration: "
-                    "session=%s",
-                    session_id,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to load persisted todo state during hydration: "
-                    "session=%s",
-                    session_id,
-                    exc_info=True,
-                )
+                data = json.loads(content)
+                if "todos" in data and isinstance(data["todos"], list):
+                    last_todo_response = data["todos"]
+                    break
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-        # Without a valid session checkpoint, walk history backwards to find
-        # the most recent authenticated todo tool response.
-        if not checkpoint_loaded:
-            for idx in range(len(history) - 1, -1, -1):
-                msg = history[idx]
-                if msg.get("role") != "tool":
-                    continue
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    continue
-                # Only accept tool results paired with a prior assistant todo call.
-                if not self._tool_response_matches_todo_call(history, idx):
-                    continue
-                if len(content) > MAX_TODO_RESULT_CHARS:
-                    logger.warning(
-                        "Skipping oversized todo tool response during hydration: "
-                        "session=%s chars=%d",
-                        self.session_id or "none",
-                        len(content),
-                    )
-                    continue
-                # Quick check: todo responses contain "todos" key
-                if '"todos"' not in content:
-                    continue
-                try:
-                    data = json.loads(content)
-                    if "todos" in data and isinstance(data["todos"], list):
-                        last_todo_response = data["todos"]
-                        break
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-        if last_todo_response is not None:
-            # Replay the items into the store (replace mode). An empty persisted
-            # list is authoritative and clears stale in-memory state.
+        if last_todo_response:
+            # Replay the items into the store (replace mode)
             self._todo_store.write(last_todo_response, merge=False)
             if not self.quiet_mode:
                 self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")

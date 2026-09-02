@@ -156,17 +156,6 @@ class TestTodoStoreBounds:
         assert len(item["content"]) <= MAX_TODO_CONTENT_CHARS
         assert item["content"].endswith("… [truncated]")
 
-    def test_oversized_id_is_truncated(self):
-        from tools.todo_tool import MAX_TODO_ID_CHARS
-
-        store = TodoStore()
-        store.write([
-            {"id": "I" * 5000, "content": "bounded id", "status": "pending"}
-        ])
-        item = store.read()[0]
-        assert len(item["id"]) <= MAX_TODO_ID_CHARS
-        assert item["id"].endswith("… [truncated]")
-
     def test_injection_block_is_bounded(self):
         from tools.todo_tool import MAX_TODO_CONTENT_CHARS
         store = TodoStore()

@@ -481,12 +481,6 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
-CREATE TRIGGER IF NOT EXISTS sessions_delete_todo_state
-AFTER DELETE ON sessions
-BEGIN
-    DELETE FROM state_meta WHERE key = 'todo_state:' || OLD.id;
-END;
-
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,

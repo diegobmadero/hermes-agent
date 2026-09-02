@@ -515,50 +515,6 @@ def test_flush_guard_clamps_overshooting_cursor():
 # ── Pass 0: merge consecutive assistant messages (issue #29148, #49147) ─────
 
 
-def test_compaction_publication_merges_summary_and_multimodal_user():
-    from agent.context_compressor import (
-        COMPRESSED_SUMMARY_METADATA_KEY,
-        SUMMARY_PREFIX,
-        _SUMMARY_END_MARKER,
-        split_user_originated_turn,
-    )
-
-    image_part = {
-        "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,ANCHOR=="},
-    }
-    messages = [
-        {
-            "role": "user",
-            "content": f"{SUMMARY_PREFIX}\nsummary\n\n{_SUMMARY_END_MARKER}",
-            COMPRESSED_SUMMARY_METADATA_KEY: True,
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "current instruction"},
-                image_part,
-            ],
-        },
-    ]
-
-    from agent.conversation_compression import (
-        _merge_summary_user_adjacency_for_publication,
-    )
-
-    repairs = _merge_summary_user_adjacency_for_publication(messages)
-
-    assert repairs == 1
-    assert len(messages) == 1
-    handoff, live_view = split_user_originated_turn(messages[0])
-    assert handoff is not None
-    assert live_view is not None
-    assert live_view["content"] == [
-        {"type": "text", "text": "current instruction"},
-        image_part,
-    ]
-
-
 # ── tool_call_id de-duplication (#58327) ────────────────────────────────────
 # Strict providers (DeepSeek) reject a payload where the same tool_call_id
 # appears more than once with HTTP 400 "Duplicate value for 'tool_call_id'".

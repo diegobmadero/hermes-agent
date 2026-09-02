@@ -28,7 +28,6 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # replayed from caller-supplied history on the API server) from inflating the
 # re-injection block. Generous relative to real plans — a todo item is a short
 # task description, and active lists are a handful of items, not hundreds.
-MAX_TODO_ID_CHARS = 256
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_ITEMS = 256
 # Upper bound on a single todo tool-result payload accepted during history
@@ -36,11 +35,6 @@ MAX_TODO_ITEMS = 256
 # history to rebuild the store, so an oversized forged result is dropped
 # before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
 MAX_TODO_RESULT_CHARS = 512_000
-# Local state.db metadata is trusted and must round-trip TodoStore's own maximum,
-# including worst-case JSON escaping of control characters in bounded IDs and
-# descriptions. Keep the caller-supplied tool-result guard above stricter;
-# those are distinct trust boundaries.
-MAX_TODO_STATE_CHARS = 8_388_608
 _TRUNCATION_MARKER = "… [truncated]"
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
@@ -80,8 +74,8 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = self._cap_id(t.get("id", ""))
-                if item_id == "?" and not str(t.get("id", "")).strip():
+                item_id = str(t.get("id", "")).strip()
+                if not item_id:
                     continue  # Can't merge without an id
 
                 if item_id in existing:
@@ -156,15 +150,6 @@ class TodoStore:
         return "\n".join(lines)
 
     @staticmethod
-    def _cap_id(item_id: Any) -> str:
-        """Normalize and bound an agent-chosen item identifier."""
-        normalized = str(item_id).strip() or "?"
-        if len(normalized) > MAX_TODO_ID_CHARS:
-            keep = MAX_TODO_ID_CHARS - len(_TRUNCATION_MARKER)
-            return normalized[:keep] + _TRUNCATION_MARKER
-        return normalized
-
-    @staticmethod
     def _cap_content(content: str) -> str:
         """Truncate oversized todo content to MAX_TODO_CONTENT_CHARS.
 
@@ -188,7 +173,9 @@ class TodoStore:
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
 
-        item_id = TodoStore._cap_id(item.get("id", ""))
+        item_id = str(item.get("id", "")).strip()
+        if not item_id:
+            item_id = "?"
 
         content = str(item.get("content", "")).strip()
         if not content:
@@ -211,7 +198,7 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = TodoStore._cap_id(item.get("id", ""))
+            item_id = str(item.get("id", "")).strip() or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 

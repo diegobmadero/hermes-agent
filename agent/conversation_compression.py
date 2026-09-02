@@ -2401,128 +2401,45 @@ def _is_real_user_message(message: Any) -> bool:
         return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
-    from agent.context_compressor import ContextCompressor
-
     text = _message_text(message).strip()
-    if not text and ContextCompressor._is_blank_user_turn(message):
+    if not text:
         return False
     if text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
+    from agent.context_compressor import ContextCompressor
 
     return not ContextCompressor._is_synthetic_compression_user_turn(message)
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:
-    """Remove a canonical todo-snapshot block from message content.
+    """Remove a previously merged todo-snapshot block from message content.
 
-    The stable header is treated as reserved scaffolding only when it appears on
-    its own line and is immediately followed by a rendered active todo item.
-    Ordinary user prose that merely quotes the header remains untouched.
+    Snapshot merges (see the injection site in ``compress_context``) always
+    append the block at the end of the trailing user turn, so a surviving
+    header marks stale todo state from an earlier compaction boundary.
+    Stripping before re-injection keeps repeated boundaries from
+    accumulating outdated snapshots (#26981).
     """
     from tools.todo_tool import TODO_INJECTION_HEADER
 
-    def _rendered_active_status(line: str) -> Optional[str]:
-        if line.startswith("- [ ] "):
-            return "pending"
-        if line.startswith("- [>] "):
-            return "in_progress"
-        return None
-
-    def _consume_rendered_active_item(lines: list[str], start: int) -> Optional[int]:
-        """Return the index after one canonical item, including old multiline rows."""
-        if start >= len(lines):
-            return None
-        status = _rendered_active_status(lines[start])
-        if status is None:
-            return None
-        suffix = f" ({status})"
-        for index in range(start, len(lines)):
-            if lines[index].endswith(suffix):
-                return index + 1
-        return None
-
     if isinstance(content, str):
-        lines = content.splitlines()
-        snapshot_index = None
-        suffix_index = None
-        for index, line in enumerate(lines[:-1]):
-            if line != TODO_INJECTION_HEADER:
-                continue
-            item_end = _consume_rendered_active_item(lines, index + 1)
-            if item_end is not None:
-                snapshot_index = index
-                suffix_index = item_end
-                break
-        if snapshot_index is None or suffix_index is None:
+        idx = content.find(TODO_INJECTION_HEADER)
+        if idx == -1:
             return content
-        prefix = "\n".join(lines[:snapshot_index]).rstrip()
-        while suffix_index < len(lines):
-            item_end = _consume_rendered_active_item(lines, suffix_index)
-            if item_end is None:
-                break
-            suffix_index = item_end
-        while suffix_index < len(lines) and not lines[suffix_index].strip():
-            suffix_index += 1
-        if (
-            suffix_index < len(lines)
-            and lines[suffix_index] == _PRUNED_SKILL_RELOAD_NOTICE_HEADER
-        ):
-            suffix_index += 1
-            # The canonical reload notice is exactly one body line after its
-            # reserved header. Consume that line regardless of wording so old
-            # notice revisions are removed too; any later suffix is preserved.
-            if suffix_index < len(lines):
-                suffix_index += 1
-            while suffix_index < len(lines) and not lines[suffix_index].strip():
-                suffix_index += 1
-        suffix = "\n".join(lines[suffix_index:]).lstrip()
-        return "\n\n".join(part for part in (prefix, suffix) if part)
+        return content[:idx].rstrip()
     if isinstance(content, list):
-        cleaned_parts = []
-        for part in content:
+        return [
+            part
+            for part in content
             if not (
                 isinstance(part, dict)
                 and part.get("type") == "text"
-                and isinstance(part.get("text"), str)
-            ):
-                cleaned_parts.append(part)
-                continue
-            stripped = _strip_stale_todo_snapshot(part["text"])
-            if stripped == part["text"]:
-                cleaned_parts.append(part)
-            elif stripped:
-                refreshed_part = dict(part)
-                refreshed_part["text"] = stripped
-                cleaned_parts.append(refreshed_part)
-        return cleaned_parts
-    return content
-
-
-def _strip_stale_todo_snapshots(messages: list) -> list:
-    """Remove every prior todo snapshot while preserving real user text."""
-    cleaned = []
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            cleaned.append(message)
-            continue
-        stripped = _strip_stale_todo_snapshot(message.get("content"))
-        if stripped == message.get("content"):
-            cleaned.append(message)
-            continue
-        if isinstance(stripped, list):
-            has_remaining_content = bool(stripped)
-        else:
-            has_remaining_content = bool(
-                _message_text({"role": "user", "content": stripped}).strip()
+                and str(part.get("text") or "")
+                .lstrip()
+                .startswith(TODO_INJECTION_HEADER)
             )
-        if not has_remaining_content:
-            continue
-        refreshed = dict(message)
-        refreshed["content"] = stripped
-        for flag in _SYNTHETIC_USER_FLAGS:
-            refreshed.pop(flag, None)
-        cleaned.append(refreshed)
-    return cleaned
+        ]
+    return content
 
 
 # Retention-parity notice (#84718): compaction re-injects the todo list
@@ -2640,70 +2557,23 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurn
     # user/user adjacency.
     from agent.context_compressor import ContextCompressor
 
-    if ContextCompressor._is_context_summary_message(messages[-1]):
-        # A trailing user-role handoff has no alternation-safe insertion slot.
-        # Build the canonical composite carrier instead: summary bytes through
-        # the end marker, then the live user payload. The summary parser can
-        # split this shape again on the next boundary, including multimodal
-        # blocks, without publishing user→user adjacency.
-        from agent.context_compressor import _SUMMARY_END_MARKER
-        from agent.turn_context import drop_stale_api_content
-
-        target = messages[-1]
-        target_content = target.get("content")
-        anchor_content = anchor.get("content")
-        if isinstance(target_content, list):
-            target_parts = list(target_content)
-            if _SUMMARY_END_MARKER not in _message_text(target):
-                target_parts.append({"type": "text", "text": _SUMMARY_END_MARKER})
-        else:
-            summary_text = str(target_content or "")
-            if _SUMMARY_END_MARKER not in summary_text:
-                summary_text = (
-                    f"{summary_text}\n\n{_SUMMARY_END_MARKER}"
-                    if summary_text
-                    else _SUMMARY_END_MARKER
-                )
-            target_parts = [{"type": "text", "text": summary_text}]
-        anchor_parts = (
-            list(anchor_content)
-            if isinstance(anchor_content, list)
-            else [{"type": "text", "text": str(anchor_content or "")}]
-        )
-        target["content"] = [*target_parts, *anchor_parts]
-        drop_stale_api_content(target)
-        return "merged"
+    if ContextCompressor._is_context_summary_content(
+        _message_text(messages[-1])
+    ):
+        # Never merge into a compaction summary: the summary prefix must
+        # stay at the start of its message for downstream summary detection.
+        # Appending after it makes the anchor "the latest user message after
+        # the summary" — exactly what the handoff prefix instructs — and the
+        # adjacent user turns are merged summary-first by
+        # repair_message_sequence before the next API call.
+        anchor[_DB_PERSISTED_MARKER] = True
+        messages.append(anchor)
+        return "inserted"
     # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
     # of inserting a consecutive same-role message (#55677 strict templates).
     _merge_anchor_into_user_message(messages[-1], anchor)
     messages[-1][_DB_PERSISTED_MARKER] = True
     return "merged"
-
-
-def _merge_summary_user_adjacency_for_publication(messages: list) -> int:
-    """Canonicalize summary→human user pairs before durable publication."""
-    from agent.context_compressor import ContextCompressor
-
-    repairs = 0
-    index = 1
-    while index < len(messages):
-        previous = messages[index - 1]
-        current = messages[index]
-        if (
-            isinstance(previous, dict)
-            and isinstance(current, dict)
-            and previous.get("role") == "user"
-            and current.get("role") == "user"
-            and ContextCompressor._is_context_summary_message(previous)
-            and _is_real_user_message(current)
-        ):
-            pair = [previous]
-            _insert_real_user_anchor(pair, current)
-            messages[index - 1 : index + 1] = pair
-            repairs += 1
-            continue
-        index += 1
-    return repairs
 
 
 def _ensure_compressed_has_user_turn(
@@ -3645,12 +3515,6 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
-        # The todo snapshot is model-visible continuity scaffolding, not source
-        # material for the next summary. Remove every prior snapshot from the
-        # context-engine projection before serialization; otherwise the
-        # summarizer can paraphrase obsolete tasks even if the final active
-        # transcript is deduplicated afterwards.
-        messages_for_compression = _strip_stale_todo_snapshots(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -3710,9 +3574,7 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
-                    compressed = compress_fn(
-                        messages_for_compression, **compress_kwargs
-                    )
+                    compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
@@ -3953,13 +3815,6 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
-        # A prior snapshot is not guaranteed to remain the tail after more
-        # turns. Sweep the complete compressed projection before refreshing it;
-        # otherwise every later boundary can retain one buried snapshot and add
-        # another at the end. This also removes stale imperatives when the todo
-        # list was cleared between boundaries.
-        compressed = _strip_stale_todo_snapshots(compressed)
-
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             # Retention parity (#84718): the snapshot below re-injects the
@@ -4020,29 +3875,9 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        # Anchor from the same cleaned projection sent to the compressor. A
-        # stale snapshot prefix can otherwise classify the whole original
-        # carrier as synthetic even when stripping reveals genuine text or
-        # multimodal input that the compressor omitted.
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(
-            messages_for_compression, compressed
+            messages, compressed
         )
-        _merge_summary_user_adjacency_for_publication(compressed)
-        # Snapshot removal and real-user anchoring can close a gap between two
-        # same-role turns. Repair the exact projection that will be returned and
-        # persisted; relying on the next API-call repair would leave an invalid
-        # durable handoff for fresh agents. Repair on per-dict copies: the merge
-        # assigns into the surviving turn, and the pipeline up to here shares
-        # dict references with evidence snapshots captured for the
-        # pre-compress memory hook — in-place mutation would rewrite already-
-        # handed-out evidence (m0 absorbing the last turn's text).
-        from agent.agent_runtime_helpers import repair_message_sequence
-
-        compressed = [
-            dict(message) if isinstance(message, dict) else message
-            for message in compressed
-        ]
-        repair_message_sequence(agent, compressed)
 
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
@@ -4099,7 +3934,6 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
-        _todo_state_payload = agent._serialize_todo_state()
         _session_commit_succeeded = False
         _commit_started_at = time.monotonic()
         split_status = "not_applicable"
@@ -4252,13 +4086,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
-                        todo_state_payload=_todo_state_payload,
                     )
-                    if _todo_state_payload is not None:
-                        agent._todo_state_checkpoint = (
-                            agent.session_id,
-                            _todo_state_payload,
-                        )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -4402,7 +4230,6 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
-                        todo_state_payload=_todo_state_payload,
                     )
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
@@ -4539,14 +4366,6 @@ def compress_context(
                         pass
                     agent._session_db_created = True
                     split_status = "rotated_committed"
-                    # The child todo checkpoint was committed atomically with
-                    # publication. Record that exact identity for ordinary-flush
-                    # deduplication; no second best-effort database write remains.
-                    if _todo_state_payload is not None:
-                        agent._todo_state_checkpoint = (
-                            agent.session_id,
-                            _todo_state_payload,
-                        )
                     # Carry a persistent /goal onto the continuation session.
                     # Compression mints a fresh child id; load_goal does a flat
                     # per-session lookup with no parent walk, so without this an
@@ -4807,7 +4626,6 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
-
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —
         # invalidate it. Context checks fall back to full estimation until

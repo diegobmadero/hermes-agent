@@ -41,35 +41,6 @@ SUMMARY = [
 
 
 class TestWatermarkCommit:
-    def test_todo_checkpoint_failure_rolls_back_in_place_compaction(
-        self, db: SessionDB
-    ) -> None:
-        _seed(db)
-        original = [row["content"] for row in db.get_messages("sess1")]
-        payload = json.dumps(
-            {"version": 1, "todos": [{"id": "t1", "content": "ship", "status": "pending"}]},
-            separators=(",", ":"),
-        )
-        db._conn.execute(
-            """
-            CREATE TRIGGER fail_in_place_todo_checkpoint
-            BEFORE INSERT ON state_meta
-            WHEN NEW.key = 'todo_state:sess1'
-            BEGIN
-                SELECT RAISE(ABORT, 'todo checkpoint failed');
-            END
-            """
-        )
-        db._conn.commit()
-
-        with pytest.raises(sqlite3.IntegrityError, match="todo checkpoint failed"):
-            db.archive_and_compact(
-                "sess1", SUMMARY, todo_state_payload=payload
-            )
-
-        assert [row["content"] for row in db.get_messages("sess1")] == original
-        assert db.get_meta("todo_state:sess1") is None
-
     def test_concurrent_tail_survives_compaction(self, db: SessionDB) -> None:
         _seed(db)
         watermark = db.get_active_message_watermark("sess1")
@@ -258,43 +229,9 @@ class TestConcurrentAppendDuringCompaction:
 
 
 class TestRotationPathWatermark:
-    """Legacy rotation carries concurrent state into a complete child."""
-
-    def test_todo_checkpoint_failure_rolls_back_child_publication(
-        self, db: SessionDB
-    ) -> None:
-        _seed(db)
-        assert db.try_acquire_compression_lock("sess1", "rotator") is True
-        payload = json.dumps(
-            {"version": 1, "todos": [{"id": "t1", "content": "ship", "status": "pending"}]},
-            separators=(",", ":"),
-        )
-        db._conn.execute(
-            """
-            CREATE TRIGGER fail_child_todo_checkpoint
-            BEFORE INSERT ON state_meta
-            WHEN NEW.key = 'todo_state:child1'
-            BEGIN
-                SELECT RAISE(ABORT, 'todo checkpoint failed');
-            END
-            """
-        )
-        db._conn.commit()
-
-        with pytest.raises(sqlite3.IntegrityError, match="todo checkpoint failed"):
-            db.publish_compression_child(
-                parent_session_id="sess1",
-                child_session_id="child1",
-                source="test",
-                messages=SUMMARY,
-                todo_state_payload=payload,
-                compression_lock_holder="rotator",
-                require_compression_lease=True,
-            )
-
-        assert db.get_session("child1") is None
-        assert db.get_session("sess1")["ended_at"] is None
-        assert db.get_meta("todo_state:child1") is None
+    """Legacy (non-in-place) compression rotates to a child session —
+    the concurrent tail must follow the rotation instead of stranding in
+    the closed parent."""
 
     @pytest.mark.parametrize(
         "tail_content",

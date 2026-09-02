@@ -23,7 +23,6 @@ import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
-from hermes_state import SessionDB
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
@@ -924,173 +923,12 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
-    def test_persisted_state_restores_when_compaction_archived_tool_result(self, agent):
-        persisted = [
-            {"id": "active", "content": "Finish the rollout", "status": "in_progress"},
-            {"id": "next", "content": "Verify the gateway", "status": "pending"},
-        ]
-        agent.session_id = "todo-persisted-session"
-        agent._session_db = MagicMock()
-        agent._session_db.get_meta.return_value = json.dumps(
-            {"version": 1, "todos": persisted}
-        )
-        history = [
-            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
-            {"role": "assistant", "content": "Ready to continue."},
-        ]
 
-        with patch("run_agent._set_interrupt"):
-            agent._hydrate_todo_store(history)
 
-        assert agent._todo_store.read() == persisted
-        agent._session_db.get_meta.assert_called_once_with(
-            "todo_state:todo-persisted-session"
-        )
 
-    def test_persisted_checkpoint_overrides_stale_valid_tool_history(self, agent):
-        agent.session_id = "todo-checkpoint-authoritative"
-        agent._session_db = MagicMock()
-        agent._session_db.get_meta.return_value = json.dumps(
-            {"version": 1, "todos": []}
-        )
-        stale = [
-            {"id": "old", "content": "Do not resurrect", "status": "pending"}
-        ]
-        history = [
-            self._assistant_todo_call("todo-old"),
-            {
-                "role": "tool",
-                "tool_call_id": "todo-old",
-                "content": json.dumps({"todos": stale}),
-            },
-        ]
-        agent._todo_store.write(stale, merge=False)
 
-        with patch("run_agent._set_interrupt"):
-            agent._hydrate_todo_store(history)
 
-        assert agent._todo_store.read() == []
-        agent._session_db.get_meta.assert_called_once_with(
-            "todo_state:todo-checkpoint-authoritative"
-        )
 
-    def test_maximum_allowed_state_round_trips_through_sqlite(
-        self, agent, tmp_path
-    ):
-        from tools.todo_tool import (
-            MAX_TODO_CONTENT_CHARS,
-            MAX_TODO_ID_CHARS,
-            MAX_TODO_ITEMS,
-            MAX_TODO_STATE_CHARS,
-        )
-
-        expected = []
-        for index in range(MAX_TODO_ITEMS):
-            prefix = f"task-{index:03d}-"
-            expected.append({
-                "id": prefix + "\0" * (MAX_TODO_ID_CHARS - len(prefix)),
-                "content": "\0" * MAX_TODO_CONTENT_CHARS,
-                "status": "in_progress" if index == 0 else "pending",
-            })
-        db = SessionDB(tmp_path / "state.db")
-        session_id = "todo-maximum-roundtrip"
-        db.create_session(session_id, source="test")
-        agent._session_db = db
-        agent.session_id = session_id
-        agent._todo_store.write(expected, merge=False)
-        agent._checkpoint_todo_state()
-        raw = db.get_meta(f"todo_state:{session_id}")
-        assert raw is not None
-        assert len(raw) > 2_048_000
-        assert len(raw) <= MAX_TODO_STATE_CHARS
-
-        with (
-            patch(
-                "run_agent.get_tool_definitions",
-                return_value=_make_tool_defs("web_search"),
-            ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
-        ):
-            fresh = AIAgent(
-                api_key="test-key-1234567890",
-                base_url="https://openrouter.ai/api/v1",
-                quiet_mode=True,
-                session_db=db,
-                session_id=session_id,
-                skip_context_files=True,
-                skip_memory=True,
-            )
-
-        with patch("run_agent._set_interrupt"):
-            fresh._hydrate_todo_store([])
-        assert fresh._todo_store.read() == expected
-        db.close()
-
-    def test_successful_flush_checkpoints_current_todo_state(self, agent):
-        current = [
-            {"id": "active", "content": "Ship the fix", "status": "in_progress"},
-            {"id": "verify", "content": "Run the replay", "status": "pending"},
-        ]
-        agent.session_id = "todo-checkpoint-session"
-        agent._session_db = MagicMock()
-        agent._todo_store.write(current, merge=False)
-
-        with patch.object(
-            agent, "_flush_messages_to_session_db_unlocked", return_value=True
-        ):
-            assert agent._flush_messages_to_session_db([]) is True
-            assert agent._flush_messages_to_session_db([]) is True
-
-        agent._session_db.set_meta.assert_called_once()
-        key, raw = agent._session_db.set_meta.call_args.args
-        assert key == "todo_state:todo-checkpoint-session"
-        assert json.loads(raw) == {"version": 1, "todos": current}
-
-    def test_successful_flush_checkpoints_todo_while_persist_lock_is_held(
-        self, agent
-    ):
-        class TrackingLock:
-            held = False
-
-            def __enter__(self):
-                self.held = True
-                return self
-
-            def __exit__(self, *_exc):
-                self.held = False
-
-        tracking_lock = TrackingLock()
-        agent._session_persist_lock = tracking_lock
-
-        def assert_locked():
-            assert tracking_lock.held is True
-
-        with (
-            patch.object(
-                agent, "_flush_messages_to_session_db_unlocked", return_value=True
-            ),
-            patch.object(
-                agent, "_checkpoint_todo_state", side_effect=assert_locked
-            ),
-        ):
-            assert agent._flush_messages_to_session_db([]) is True
-
-    def test_persisted_empty_state_clears_stale_store(self, agent):
-        agent.session_id = "todo-cleared-session"
-        agent._session_db = MagicMock()
-        agent._session_db.get_meta.return_value = json.dumps(
-            {"version": 1, "todos": []}
-        )
-        agent._todo_store.write(
-            [{"id": "stale", "content": "Do not resume", "status": "in_progress"}],
-            merge=False,
-        )
-
-        with patch("run_agent._set_interrupt"):
-            agent._hydrate_todo_store([])
-
-        assert agent._todo_store.read() == []
 
 
 class TestBuildSystemPrompt:

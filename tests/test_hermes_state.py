@@ -1048,18 +1048,6 @@ class TestDeleteAndExport:
 
 
 
-    def test_delete_session_removes_only_its_todo_checkpoint(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.set_meta("todo_state:s1", '{"version":1,"todos":[]}')
-        db.set_meta("todo_state:other", "keep")
-        db.set_meta("scheduler:last_run", "keep-too")
-
-        assert db.delete_session("s1") is True
-
-        assert db.get_meta("todo_state:s1") is None
-        assert db.get_meta("todo_state:other") == "keep"
-        assert db.get_meta("scheduler:last_run") == "keep-too"
-
     def test_resolve_session_id_ambiguous_prefix_returns_none(self, db):
         db.create_session(session_id="20260315_092437_c9a6aa", source="cli")
         db.create_session(session_id="20260315_092437_c9a6bb", source="cli")

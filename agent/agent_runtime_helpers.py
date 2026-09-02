@@ -710,10 +710,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # (#77921).  Popping is non-destructive: an empty array
                 # carries no information.
                 prev.pop("tool_calls", None)
-            # Preserve multimodal blocks losslessly when collapsing adjacent
-            # assistant turns. Keeping only the earlier list silently drops
-            # attachments from the later turn (notably after compaction removes
-            # a stale synthetic user carrier).
+            # Concatenate plain-text content; leave multimodal (list)
+            # content on either side alone to avoid mangling attachment
+            # blocks — fall back to keeping the existing content.
             prev_content = prev.get("content")
             new_content = msg.get("content")
             content_rewritten = False
@@ -927,9 +926,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         ):
             prev = merged[-1]
             # A summary carrier followed by a new user row is a deliberate
-            # durable shape after retry/rewind. Do not absorb the fresh ask
-            # into the already-persisted carrier here; the compaction
-            # publication boundary canonicalizes its own summary/user pair.
+            # durable shape after retry/rewind.  Do not absorb the fresh ask
+            # into the already-persisted carrier: mutating that dict can make
+            # the only in-memory copy diverge from its durable row.  Provider
+            # sanitizers merge copies later when strict alternation requires
+            # it, without rewriting either durable message.
             from agent.context_compressor import split_user_originated_turn
 
             handoff, _ = split_user_originated_turn(prev)
