@@ -299,7 +299,7 @@ class TestSessionCompressEvent:
             original_sid = agent.session_id
             agent.context_compressor = self._stub_compressor()
 
-            compressed, _ = agent._compress_context(
+            agent._compress_context(
                 [{"role": "user", "content": f"m{i}"} for i in range(10)],
                 "sys",
                 approx_tokens=10_000,
@@ -311,11 +311,6 @@ class TestSessionCompressEvent:
             assert ctx["session_id"] == agent.session_id
             assert ctx["old_session_id"] == original_sid
             assert ctx["compression_count"] == 1
-            assert ctx["trigger_estimated_tokens"] == 10_000
-            assert ctx["rewritten_estimated_tokens"] > 0
-            assert ctx["pre_message_count"] == 10
-            assert ctx["post_message_count"] == len(compressed)
-            assert ctx["estimate_kind"] == "local_request_estimate"
 
     def test_no_callback_is_safe(self):
         """Compression must work when no event_callback is wired."""

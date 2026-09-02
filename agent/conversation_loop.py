@@ -258,59 +258,6 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
-def _emit_compaction_verified_event(
-    agent: Any,
-    *,
-    completed_compaction_pending: bool,
-    usage: Dict[str, Any],
-) -> bool:
-    """Emit the first provider-measured request after a committed compaction."""
-    callback = getattr(agent, "event_callback", None)
-    try:
-        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        prompt_tokens = 0
-    if not completed_compaction_pending or prompt_tokens <= 0 or not callable(callback):
-        return False
-
-    compressor = agent.context_compressor
-
-    def _int_attr(name: str) -> int:
-        try:
-            value = int(getattr(compressor, name, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-        return value if value > 0 else 0
-
-    try:
-        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        completion_tokens = 0
-    try:
-        callback(
-            "session:compress:verified",
-            {
-                "platform": getattr(agent, "platform", None) or "",
-                "session_id": getattr(agent, "session_id", None) or "",
-                "compression_count": _int_attr("compression_count"),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": max(0, completion_tokens),
-                "rewritten_estimated_tokens": _int_attr(
-                    "last_compression_rough_tokens"
-                ),
-                "threshold_tokens": _int_attr("threshold_tokens"),
-                "context_window_tokens": _int_attr("context_length"),
-            },
-        )
-    except Exception:
-        logger.debug(
-            "event_callback error on session:compress:verified",
-            exc_info=True,
-        )
-        return False
-    return True
-
-
 def _should_rearm_compression_budget(
     compression_attempts: int,
     *,
@@ -4279,11 +4226,6 @@ def run_conversation(
                     )
                     if _new_anchor is not None:
                         agent._usage_anchor = _new_anchor
-                    _emit_compaction_verified_event(
-                        agent,
-                        completed_compaction_pending=_completed_compaction_pending,
-                        usage=usage_dict,
-                    )
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0

@@ -23,10 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.conversation_loop import (
-    _emit_compaction_verified_event,
-    _should_rearm_compression_budget,
-)
+from agent.conversation_loop import _should_rearm_compression_budget
 from run_agent import AIAgent
 
 
@@ -36,70 +33,6 @@ from run_agent import AIAgent
 
 
 class TestRearmDecision:
-    def test_verified_event_reports_first_provider_measurement_once(self):
-        events = []
-        compressor = SimpleNamespace(
-            compression_count=3,
-            last_compression_rough_tokens=61_200,
-            threshold_tokens=90_000,
-            context_length=131_072,
-        )
-        agent = SimpleNamespace(
-            event_callback=lambda event, context: events.append((event, context)),
-            context_compressor=compressor,
-            platform="telegram",
-            session_id="session-1",
-        )
-
-        assert _emit_compaction_verified_event(
-            agent,
-            completed_compaction_pending=True,
-            usage={"prompt_tokens": 40_075, "completion_tokens": 700},
-        )
-        assert events == [
-            (
-                "session:compress:verified",
-                {
-                    "platform": "telegram",
-                    "session_id": "session-1",
-                    "compression_count": 3,
-                    "prompt_tokens": 40_075,
-                    "completion_tokens": 700,
-                    "rewritten_estimated_tokens": 61_200,
-                    "threshold_tokens": 90_000,
-                    "context_window_tokens": 131_072,
-                },
-            )
-        ]
-
-    def test_verified_event_requires_pending_boundary_and_real_usage(self):
-        callback = MagicMock()
-        agent = SimpleNamespace(event_callback=callback, context_compressor=SimpleNamespace())
-
-        assert not _emit_compaction_verified_event(
-            agent,
-            completed_compaction_pending=False,
-            usage={"prompt_tokens": 40_075},
-        )
-        assert not _emit_compaction_verified_event(
-            agent,
-            completed_compaction_pending=True,
-            usage={"prompt_tokens": 0},
-        )
-        callback.assert_not_called()
-
-    def test_verified_event_callback_failure_is_non_blocking(self):
-        agent = SimpleNamespace(
-            event_callback=MagicMock(side_effect=RuntimeError("hook failed")),
-            context_compressor=SimpleNamespace(),
-        )
-
-        assert not _emit_compaction_verified_event(
-            agent,
-            completed_compaction_pending=True,
-            usage={"prompt_tokens": 40_075},
-        )
-
     def test_provider_confirmed_recovery_rearms(self):
         assert _should_rearm_compression_budget(
             2,
