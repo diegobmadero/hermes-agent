@@ -136,10 +136,10 @@ def test_skills_index_policy_is_forwarded_to_prompt_builder():
         _skills_index_featured=frozenset({"pepchat", "telegram"}),
     )
     with (
-        patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value=""),
-        patch("run_agent.build_skills_system_prompt", return_value="FEATURED") as build_skills,
+        patch("agent.prompt_builder.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.build_environment_hints", return_value=""),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+        patch("agent.prompt_builder.build_skills_system_prompt", return_value="FEATURED") as build_skills,
     ):
         parts = build_system_prompt_parts(agent)
 
