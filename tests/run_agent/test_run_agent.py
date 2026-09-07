@@ -989,10 +989,10 @@ class TestBuildSystemPrompt:
 
         with (
             patch(
-                "run_agent.get_tool_definitions",
+                "model_tools.get_tool_definitions",
                 return_value=_make_tool_defs("web_search", "reasoning_effort"),
             ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("model_tools.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
         ):
             agent = AIAgent(
