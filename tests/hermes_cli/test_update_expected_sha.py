@@ -907,3 +907,175 @@ def test_unpinned_syntax_rollback_retains_existing_reset_semantics(
         hermes_update_cmd._rollback_if_pulled_syntax_error(["git"], graph.base)
 
     assert _git_sha(graph.work) == graph.base
+
+
+# ---------------------------------------------------------------------------
+# Pinned rollback vs ignored local bytes (ASTRA-R1)
+# ---------------------------------------------------------------------------
+
+def _build_ignored_collision_repo(tmp_path: Path, *, directory_obstruction: bool = False):
+    """base tracks cache/recover.txt (force-added past the ignore rule) and a valid
+    cli.py; pinned removes it and breaks cli.py. After the pinned checkout a local
+    process recreates the now-ignored path with unrelated bytes (or as a directory
+    with its own state, for the obstruction variant)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (repo / "cache").mkdir()
+    (repo / "cache" / "recover.txt").write_text("old tracked content\n", encoding="utf-8")
+    (repo / "cli.py").write_text("print('valid fixture')\n", encoding="utf-8")
+    _git(repo, "add", "-f", "cache/recover.txt")
+    _git(repo, "add", ".gitignore", "cli.py")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pre-update")
+    base = _git_sha(repo)
+    _git(repo, "rm", "-q", "cache/recover.txt")
+    (repo / "cli.py").write_text("def broken(:\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pinned bad syntax")
+    pinned = _git_sha(repo)
+    (repo / "cache").mkdir(exist_ok=True)
+    if directory_obstruction:
+        (repo / "cache" / "recover.txt").mkdir()
+        (repo / "cache" / "recover.txt" / "notes.txt").write_text(
+            "local directory state\n", encoding="utf-8")
+    else:
+        (repo / "cache" / "recover.txt").write_text(
+            "unrelated ignored local notes\n", encoding="utf-8")
+    return SimpleNamespace(repo=repo, base=base, pinned=pinned)
+
+
+def test_pinned_rollback_refuses_ignored_file_collision_and_preserves_bytes(
+    git_isolation, tmp_path, monkeypatch, capsys
+):
+    """The rollback restores cache/recover.txt; an ignored local file already sits
+    there. Automatic reset must be refused, the local bytes preserved byte-for-byte,
+    HEAD left on the pinned commit, and both SHAs retained."""
+    graph = _build_ignored_collision_repo(tmp_path)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", graph.repo)
+    local_bytes = (graph.repo / "cache" / "recover.txt").read_bytes()
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_update_cmd._rollback_if_pulled_syntax_error(
+            ["git"], graph.base, expected_sha=graph.pinned)
+
+    assert _git_sha(graph.repo) == graph.pinned
+    assert (graph.repo / "cache" / "recover.txt").read_bytes() == local_bytes
+    out = capsys.readouterr().out
+    assert "Refusing automatic rollback" in out
+    assert graph.pinned in out and graph.base in out
+
+
+def test_pinned_rollback_refuses_ignored_directory_obstruction(
+    git_isolation, tmp_path, monkeypatch, capsys
+):
+    """The restored path is occupied by an ignored local DIRECTORY: rollback must
+    not delete or replace that unrelated directory state."""
+    graph = _build_ignored_collision_repo(tmp_path, directory_obstruction=True)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", graph.repo)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_update_cmd._rollback_if_pulled_syntax_error(
+            ["git"], graph.base, expected_sha=graph.pinned)
+
+    assert _git_sha(graph.repo) == graph.pinned
+    assert (graph.repo / "cache" / "recover.txt").is_dir()
+    assert (
+        (graph.repo / "cache" / "recover.txt" / "notes.txt").read_text(encoding="utf-8")
+        == "local directory state\n"
+    )
+    out = capsys.readouterr().out
+    assert "Refusing automatic rollback" in out
+    assert graph.pinned in out and graph.base in out
+
+
+def test_pinned_rollback_allows_harmless_noncolliding_ignored_cache(
+    git_isolation, tmp_path, monkeypatch
+):
+    """Control: an ignored file untouched by the restored tree must not disable
+    the valid rollback, and must itself be preserved."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    (repo / "cli.py").write_text("print('valid fixture')\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pre-update")
+    base = _git_sha(repo)
+    (repo / "cli.py").write_text("def broken(:\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pinned bad syntax")
+    pinned = _git_sha(repo)
+    (repo / "debug.log").write_text("harmless ignored cache\n", encoding="utf-8")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_update_cmd._rollback_if_pulled_syntax_error(["git"], base, expected_sha=pinned)
+
+    assert _git_sha(repo) == base
+    assert (repo / "cli.py").read_text(encoding="utf-8") == "print('valid fixture')\n"
+    assert (repo / "debug.log").read_text(encoding="utf-8") == "harmless ignored cache\n"
+
+
+def test_pinned_update_rollback_refuses_ignored_collision_at_command_boundary(
+    git_isolation, update_seams, tmp_path, monkeypatch, capsys
+):
+    """Full production boundary: the ignored collision is created by a local process
+    between the exact fast-forward and syntax validation; the failed transaction must
+    keep the pinned HEAD, the local bytes, and record a failed receipt."""
+    graph = _build_pinned_graph(tmp_path)
+    # Rebuild the seed history with the ignore/collision shape.
+    _git(graph.seed, "rm", "-q", "file2.txt")
+    (graph.seed / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (graph.seed / "cache").mkdir()
+    (graph.seed / "cache" / "recover.txt").write_text("old tracked content\n", encoding="utf-8")
+    (graph.seed / "cli.py").write_text("print('valid fixture')\n", encoding="utf-8")
+    _git(graph.seed, "add", "-f", "cache/recover.txt")
+    _git(graph.seed, "add", ".gitignore", "cli.py")
+    _git(graph.seed, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pre-update state")
+    base = _git_sha(graph.seed)
+    _git(graph.seed, "rm", "-q", "cache/recover.txt")
+    (graph.seed / "cli.py").write_text("def broken(:\n", encoding="utf-8")
+    _git(graph.seed, "add", "-A")
+    _git(graph.seed, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pinned bad syntax")
+    broken = _git_sha(graph.seed)
+    _git(graph.seed, "push", "-f", "origin", f"{graph.branch}:{graph.branch}")
+    _git(graph.work, "fetch", "origin", graph.branch)
+    _git(graph.work, "reset", "--hard", base)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", graph.work)
+
+    def collision_seam(cmd, **kwargs):
+        result = _REAL_RUN(cmd, **kwargs)
+        if list(cmd)[:3] == ["git", "merge", "--ff-only"]:
+            # A local process recreates the now-ignored path after the exact ff.
+            (graph.work / "cache").mkdir(exist_ok=True)
+            (graph.work / "cache" / "recover.txt").write_text(
+                "unrelated ignored local notes\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", collision_seam)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(_update_args(graph.branch, broken))
+
+    assert exc_info.value.code == 1
+    assert _git_sha(graph.work) == broken  # pinned HEAD unmoved — no reset happened
+    assert (
+        (graph.work / "cache" / "recover.txt").read_text(encoding="utf-8")
+        == "unrelated ignored local notes\n"
+    )
+    assert update_seams.installs == []
+    out = capsys.readouterr().out
+    assert "Refusing automatic rollback" in out
+    assert broken in out and base in out
+    latest = update_receipt.read_latest_receipt()
+    assert latest is not None
+    assert latest["outcome"] == "failed"
+    assert latest["exit_code"] == 1
+

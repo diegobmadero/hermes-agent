@@ -720,10 +720,48 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         sys.exit(1)
 
 
+def _pinned_rollback_collisions(git_cmd, expected_sha: str, pre_pull_sha) -> "list[str] | None":
+    """Ignored/untracked local paths colliding with the tree the pinned rollback restores.
+
+    ``status --porcelain --untracked-files=all`` (the clean check above) omits IGNORED
+    files, but ``reset --hard`` overwrites them when the restored commit tracks the same
+    path. Collisions are: a local ignored/untracked file at exactly a restored path, or
+    local state inside a path the restore must recreate as a file. Harmless ignored caches
+    elsewhere do not collide. ``None`` when Git state is indeterminate (caller refuses)."""
+    delta = _git_run(
+        git_cmd, ["diff", "--name-only", "-z", "--no-renames", expected_sha, pre_pull_sha],
+        _m().PROJECT_ROOT)
+    if delta.returncode != 0:
+        return None
+    targets = {path for path in delta.stdout.split("\0") if path}
+    if not targets:
+        return []
+    status = _git_run(
+        git_cmd,
+        ["status", "--porcelain", "-z", "--ignored", "--untracked-files=all"],
+        _m().PROJECT_ROOT)
+    if status.returncode != 0:
+        return None
+    collisions: list[str] = []
+    for record in status.stdout.split("\0"):
+        if not record:
+            continue
+        flag, path = record[:2], record[3:]
+        if flag not in {"!!", "??"}:
+            continue
+        if path.endswith("/"):
+            # An ignored empty/shared directory is not itself overwritten.
+            continue
+        if any(path == target or path.startswith(target + "/") for target in targets):
+            collisions.append(path)
+    return collisions
+
+
 def _pinned_rollback_precheck(git_cmd, expected_sha: str, pre_pull_sha) -> bool:
     """Gate the pinned failed-transaction rollback: only reset when HEAD is still the exact
-    commit this invocation installed and no raced working-tree change would be discarded.
-    Both SHAs are retained in the refusal so recovery evidence is never lost."""
+    commit this invocation installed and no raced working-tree change — including ignored
+    local bytes colliding with the restored tree — would be discarded. Both SHAs are
+    retained in the refusal so recovery evidence is never lost."""
     head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
     if head != expected_sha:
         print("  ✗ Refusing automatic rollback: HEAD is no longer the pinned commit this")
@@ -741,6 +779,23 @@ def _pinned_rollback_precheck(git_cmd, expected_sha: str, pre_pull_sha) -> bool:
         print(f"    Pinned commit:   {expected_sha}")
         print(f"    Pre-update SHA:  {pre_pull_sha}")
         print("    Review the checkout and recover manually.")
+        return False
+    collisions = _pinned_rollback_collisions(git_cmd, expected_sha, pre_pull_sha)
+    if collisions is None:
+        print("  ✗ Refusing automatic rollback: could not determine ignored-file collisions")
+        print("    with the tree being restored (indeterminate Git state).")
+        print(f"    Pinned commit:   {expected_sha}")
+        print(f"    Pre-update SHA:  {pre_pull_sha}")
+        print("    Review the checkout and recover manually.")
+        return False
+    if collisions:
+        print("  ✗ Refusing automatic rollback: ignored local path(s) collide with the tree")
+        print("    being restored and would be overwritten:")
+        for path in collisions[:10]:
+            print(f"    {path}")
+        print(f"    Pinned commit:   {expected_sha}")
+        print(f"    Pre-update SHA:  {pre_pull_sha}")
+        print("    Move the ignored path(s) aside and recover manually.")
         return False
     return True
 
