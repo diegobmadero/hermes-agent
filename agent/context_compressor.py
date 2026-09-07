@@ -954,10 +954,6 @@ def _collect_protected_skill_names(messages: List[Dict[str, Any]], prune_boundar
 
 
 _CHARS_PER_TOKEN = 4
-# Flat per-image token estimate (realistic ceiling; matches Claude Code's constant).
-_IMAGE_TOKEN_ESTIMATE = 1600
-# Same figure in char-budget currency.
-_IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 # Fallback handoff preserves continuity anchors only, not a transcript copy.
@@ -1072,14 +1068,18 @@ def _bullets(items: list[str], limit: int = 8) -> str:
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
-    """Effective char-length of message content for budgeting: text by length plus ``_IMAGE_CHAR_EQUIVALENT`` per image."""
+    """Effective char-length of message content for budgeting: text by length plus the learned
+    per-image price (``agent.image_token_cost``, same figure the trigger estimator uses) per image."""
     if isinstance(raw_content, str):
         return len(raw_content)
     if not isinstance(raw_content, list):
         return len(str(raw_content or ""))
+    from agent.image_token_cost import current_image_token_cost
+
+    image_chars = current_image_token_cost() * _CHARS_PER_TOKEN
     # Any text-bearing part counts its text; image_url payload size is irrelevant.
     return sum(
-        (_IMAGE_CHAR_EQUIVALENT if _is_image_part(p) else len(p.get("text", "") or "")) if isinstance(p, dict) else len(str(p))
+        (image_chars if _is_image_part(p) else len(p.get("text", "") or "")) if isinstance(p, dict) else len(str(p))
         for p in raw_content
     )
 
@@ -1128,7 +1128,9 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     and always-replayed provider fields. Always-replayed fields are charged because the preflight estimator sees
     the full shape; a mismatched size class protects blob-heavy rows as "small" and compaction re-fires.
     ``charge_stale_thinking=False`` skips newest-turn-only thinking keys. Accounting only; never mutates."""
-    content = msg.get("content") or ""
+    # Charge the wire substitute, not both it and the clean display content.
+    sidecar = msg.get("api_content")
+    content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
     text_tokens = estimate_tokens_rough(content) if isinstance(content, str) else _content_length_for_budget(content) // _CHARS_PER_TOKEN
     tokens = text_tokens + 10  # +10 for role/key overhead
     tokens += sum(estimate_tokens_rough(str(tc)) for tc in msg.get("tool_calls") or [] if isinstance(tc, dict))
