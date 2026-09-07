@@ -69,7 +69,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         metavar="SHA",
         help=(
             "Require the fetched update branch to resolve to this exact commit "
-            "and advance only by fast-forward"
+            "and advance only by fast-forward. Strict mode: the checkout must "
+            "already be on the target branch with a clean working tree. A pinned "
+            "update never switches branches, stashes, reconciles diverged "
+            "history, synchronizes a fork with upstream, or uses the ZIP route."
         ),
     )
     update_parser.add_argument(

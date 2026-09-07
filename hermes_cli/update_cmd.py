@@ -720,9 +720,36 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         sys.exit(1)
 
 
-def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
+def _pinned_rollback_precheck(git_cmd, expected_sha: str, pre_pull_sha) -> bool:
+    """Gate the pinned failed-transaction rollback: only reset when HEAD is still the exact
+    commit this invocation installed and no raced working-tree change would be discarded.
+    Both SHAs are retained in the refusal so recovery evidence is never lost."""
+    head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    if head != expected_sha:
+        print("  ✗ Refusing automatic rollback: HEAD is no longer the pinned commit this")
+        print("    invocation installed — not resetting a foreign/moved checkout.")
+        print(f"    Pinned commit:   {expected_sha}")
+        print(f"    Current HEAD:    {head or 'unresolved'}")
+        print(f"    Pre-update SHA:  {pre_pull_sha}")
+        print("    Review the checkout and recover manually.")
+        return False
+    status = _git_run(
+        git_cmd, ["status", "--porcelain", "--untracked-files=all"], _m().PROJECT_ROOT)
+    if status.returncode != 0 or status.stdout.strip():
+        print("  ✗ Refusing automatic rollback: the working tree changed since the pinned")
+        print("    fast-forward — not discarding unknown local state.")
+        print(f"    Pinned commit:   {expected_sha}")
+        print(f"    Pre-update SHA:  {pre_pull_sha}")
+        print("    Review the checkout and recover manually.")
+        return False
+    return True
+
+
+def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, expected_sha: str | None = None) -> None:
     """Post-pull syntax guard: roll back to *pre_pull_sha* and ``sys.exit(1)`` when a critical
-    file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
+    file no longer compiles (a bad admin-merge past CI must not brick the CLI). In pin mode
+    the reset is a narrowly-scoped failed local transaction: it runs only when the checkout
+    is still exactly the state this invocation produced, and always reports failure."""
     syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:
         return
@@ -734,6 +761,10 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
         print(f"    {line}")
     print()
     if pre_pull_sha:
+        if expected_sha is not None and not _pinned_rollback_precheck(
+            git_cmd, expected_sha, pre_pull_sha
+        ):
+            sys.exit(1)
         print(f"→ Rolling back to {pre_pull_sha[:10]}...")
         rollback_result = _git_run(git_cmd, ["reset", "--hard", pre_pull_sha])
         if rollback_result.returncode == 0:
@@ -752,22 +783,39 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
 
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
-    keep_stash):
+    keep_stash, expected_sha: str | None = None):
     """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
     custom branch -> merge, same branch -> reset, orphan history -> rescue ref first; a
-    post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
+    post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA.
+
+    Pin mode (``expected_sha`` set) merges the immutable pinned commit itself — never the
+    movable tracking ref — refuses instead of reconciling on any ff failure, and verifies
+    the exact HEAD inside the success region, before syntax acceptance."""
     update_succeeded = False
     # Pre-pull SHA for auto-rollback (stray conflict markers once bricked every updater).
     # Capture the pre-pull SHA so we can auto-roll-back if the new code has a syntax error in a
     # critical-path file (PR #28452 incident: orphan merge-conflict markers in hermes_cli/config.py bricked
     # every user who ran ``hermes update`` for the 7 minutes between the bad commit and the fix landing).
     pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    merge_target = expected_sha if expected_sha else f"origin/{branch}"
     try:
         # merge --ff-only the already-fetched ref instead of `git pull`, which would do a
-        # SECOND network fetch; identical in effect given the fresh tracking ref.
-        if _git_run(git_cmd, ["merge", "--ff-only", f"origin/{branch}"]).returncode != 0:
+        # SECOND network fetch; identical in effect given the fresh tracking ref. Pin mode
+        # targets the immutable expected commit: a tracking ref moved by another writer
+        # after the fetch cannot redirect the update.
+        if _git_run(git_cmd, ["merge", "--ff-only", merge_target]).returncode != 0:
+            if expected_sha:
+                print("✗ Fast-forward to the pinned commit failed — refusing to reconcile.")
+                print("  Pinned updates never merge, reset, or rewrite diverged history.")
+                print("  Align the checkout with the pinned commit manually, then retry.")
+                sys.exit(1)
             _reconcile_diverged_checkout(git_cmd, branch, pre_pull_sha)
-        _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha)
+        if expected_sha:
+            # Exact-HEAD proof inside the success region, before syntax acceptance and
+            # before any install stage: counts and merge exit codes are not evidence.
+            _require_expected_sha(
+                git_cmd, expected_sha=expected_sha, ref="HEAD", label="Updated HEAD")
+        _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, expected_sha=expected_sha)
         update_succeeded = True
     finally:
         if auto_stash_ref is not None:
@@ -845,12 +893,65 @@ def _apply_parked_branch_guard(
     return False, True, switch_block_reason
 
 
+def _prepare_pinned_checkout(git_cmd, branch: str, current_branch: str, expected_sha: str) -> _CheckoutPlan:
+    """Strict pin-mode gate for ``--expected-sha``: the checkout must ALREADY be a clean Git
+    checkout on the requested target branch, with HEAD an ancestor of the pinned commit.
+    Anything else is refused — pin mode never stashes, switches/creates branches, runs the
+    parked-branch machinery, or synchronizes a fork with upstream. Indeterminate Git state
+    is a refusal, never permission. Only read-only Git commands run here."""
+    expected = expected_sha.lower()
+    if _capture_head_sha(git_cmd, _m().PROJECT_ROOT) is None:
+        print("✗ --expected-sha: cannot resolve HEAD in this checkout — pinned update refused.")
+        sys.exit(1)
+    if current_branch != branch:
+        where = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
+        print(f"✗ --expected-sha requires the checkout to already be on '{branch}' (currently: {where}).")
+        print("  Pinned updates never switch branches automatically.")
+        print(f"  Switch manually: git -C {_m().PROJECT_ROOT} checkout {branch}")
+        sys.exit(1)
+    status = _git_run(
+        git_cmd, ["status", "--porcelain", "--untracked-files=all"], _m().PROJECT_ROOT)
+    if status.returncode != 0:
+        print("✗ --expected-sha: could not determine working-tree state — pinned update refused.")
+        if status.stderr.strip():
+            print(f"  {status.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+    if status.stdout.strip():
+        print("✗ --expected-sha requires a clean working tree (tracked and untracked).")
+        print("  Pinned updates never stash or discard local changes automatically.")
+        print("  Commit, stash, or clean up manually, then re-run the pinned update.")
+        sys.exit(1)
+    ancestry = _git_run(git_cmd, ["merge-base", "--is-ancestor", "HEAD", expected], _m().PROJECT_ROOT)
+    if ancestry.returncode == 1:
+        print("✗ --expected-sha: current HEAD is not an ancestor of the pinned commit")
+        print("  (diverged or local-ahead history). Pinned updates never reconcile,")
+        print("  reset, or merge; align the checkout manually and retry.")
+        sys.exit(1)
+    if ancestry.returncode != 0:
+        print("✗ --expected-sha: could not prove HEAD ancestry against the pinned commit —")
+        print("  pinned update refused (an unreadable graph is never permission).")
+        if ancestry.stderr.strip():
+            print(f"  {ancestry.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+    result = _git_run(git_cmd, ["rev-list", f"HEAD..origin/{branch}", "--count"], _m().PROJECT_ROOT, check=True)
+    commit_count = int(result.stdout.strip())
+    # The shallow-checkout count refinement (GitHub compare API) is skipped in pin mode:
+    # the fetch is the one network operation, and the exact-HEAD gates decide acceptance.
+    return _CheckoutPlan(
+        auto_stash_ref=None, commit_count=commit_count, in_place_update=False,
+        parked_branch_switched=False, prompt_for_restore=False,
+        switch_block_reason=None, upstream_checked=True)
+
+
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
-    switch_branch, _windows_gateway_resume):
+    switch_branch, _windows_gateway_resume, expected_sha: str | None = None):
     """Parked-branch guard, land on the target, stash, count new commits. Exits when the
     checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
-    date, -1 when tips differ but the shallow count is unrecoverable."""
+    date, -1 when tips differ but the shallow count is unrecoverable. Pin mode delegates
+    to the strict ``_prepare_pinned_checkout`` gate."""
+    if expected_sha is not None:
+        return _prepare_pinned_checkout(git_cmd, branch, current_branch, expected_sha)
     parked_branch_switched, in_place_update, switch_block_reason = _apply_parked_branch_guard(
         git_cmd, branch, current_branch, switch_branch=switch_branch,
         _windows_gateway_resume=_windows_gateway_resume)
@@ -1017,9 +1118,11 @@ def _begin_update_receipt_and_plan(args):
     return _pre_update_plan
 
 
-def _prepare_git_command() -> tuple[bool, list, bool]:
+def _prepare_git_command(*, expected_sha: str | None = None) -> tuple[bool, list, bool]:
     """Return ``(use_zip_update, git_cmd, is_fork)``; ``sys.exit(1)`` when not a git repo
-    on a non-Windows host (Windows falls back to ZIP: broken git file I/O, AV, NTFS filters)."""
+    on a non-Windows host (Windows falls back to ZIP: broken git file I/O, AV, NTFS filters).
+    Pin mode (``--expected-sha``) skips the managed source-cleaning passes: the strict
+    precondition gate must observe the tree exactly as the operator left it."""
     git_dir = _m().PROJECT_ROOT / ".git"
     use_zip_update = not git_dir.exists()
     if use_zip_update and sys.platform != "win32":
@@ -1035,10 +1138,11 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
     # See #87876.
     git_cmd = _ensure_non_trampoline_git(git_cmd)
 
-    # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
-    # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if expected_sha is None:
+        # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
+        # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -1099,8 +1203,15 @@ def _current_branch_name(git_cmd, *, check: bool = False) -> str:
 
 def _handle_update_called_process_error(
     e, args, gateway_mode: bool, had_desktop_app_before_update: bool) -> None:
-    """Git/installer failure: ZIP-fallback when safe, else report and ``sys.exit(1)``."""
+    """Git/installer failure: ZIP-fallback when safe, else report and ``sys.exit(1)``.
+    A pinned update never takes the ZIP route — not even for Git-shaped errors."""
     stage = _format_update_failure_stage(e)
+    if getattr(args, "expected_sha", None):
+        print(f"✗ {stage}: {e}")
+        _print_called_process_error_tail(e)
+        print("  --expected-sha forbids the ZIP fallback; the pinned commit was not installed.")
+        _finalize_receipt("failed", 'Update receipt finalize failed: %s')
+        sys.exit(1)
     if _should_zip_fallback_on_update_error(e):
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
@@ -1182,8 +1293,10 @@ def _finish_already_up_to_date(
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
-    _windows_gateway_resume) -> None:
-    """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
+    _windows_gateway_resume, expected_sha: str | None = None) -> None:
+    """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart.
+    Pin mode (``expected_sha``) suppresses the optional fork-main upstream sync: the exact
+    pinned HEAD verified above must not move after the gate."""
     _invalidate_update_cache()
     post_pull_sha = _verify_head_after_pull(
         git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
@@ -1197,7 +1310,7 @@ def _apply_pulled_update(
     # Stale .pyc would ImportError on gateway restart when new source references new names.
     _sweep_bytecode_after_update(branch)
 
-    if is_fork and branch == "main":
+    if is_fork and branch == "main" and expected_sha is None:
         _m()._sync_with_upstream_if_needed(
             git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
 
@@ -1278,9 +1391,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
     desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
     had_desktop_app_before_update = _desktop_app_present(desktop_dir)
 
-    use_zip_update, git_cmd, is_fork = _prepare_git_command()
+    # Read the pin once, normalized; every stage below consumes this same value.
+    expected_sha = (getattr(args, "expected_sha", None) or "").lower() or None
+    use_zip_update, git_cmd, is_fork = _prepare_git_command(expected_sha=expected_sha)
 
     if use_zip_update:
+        if expected_sha is not None:
+            print("✗ --expected-sha requires a Git checkout; the ZIP update route cannot")
+            print("  honor a pinned commit and is refused. No files were changed.")
+            sys.exit(1)
         try:
             desktop_build_ok = _update_via_zip(
                 args, had_desktop_app_before_update=had_desktop_app_before_update)
@@ -1314,7 +1433,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
-        expected_sha = getattr(args, "expected_sha", None)
         _require_expected_sha(
             git_cmd, expected_sha=expected_sha, ref=f"origin/{branch}",
             label=f"Fetched origin/{branch}",
@@ -1324,7 +1442,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
-            _windows_gateway_resume=_windows_gateway_resume)
+            _windows_gateway_resume=_windows_gateway_resume, expected_sha=expected_sha)
         commit_count = _plan.commit_count
 
         if commit_count == 0:
@@ -1351,7 +1469,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
-            keep_stash=opts.keep_stash)
+            keep_stash=opts.keep_stash, expected_sha=expected_sha)
         _require_expected_sha(
             git_cmd, expected_sha=expected_sha, ref="HEAD", label="Updated HEAD",
         )
@@ -1360,7 +1478,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             is_fork=is_fork, desktop_dir=desktop_dir,
             had_desktop_app_before_update=had_desktop_app_before_update,
             pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
-            _windows_gateway_resume=_windows_gateway_resume)
+            _windows_gateway_resume=_windows_gateway_resume, expected_sha=expected_sha)
     except _shim_quarantine_error_type() as e:
         # Strict quarantine refused BEFORE any installer ran — defer via marker, exit 2, no ZIP.
         # See #87331.
