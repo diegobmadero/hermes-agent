@@ -725,9 +725,10 @@ def _pinned_rollback_collisions(git_cmd, expected_sha: str, pre_pull_sha) -> "li
 
     ``status --porcelain --untracked-files=all`` (the clean check above) omits IGNORED
     files, but ``reset --hard`` overwrites them when the restored commit tracks the same
-    path. Collisions are: a local ignored/untracked file at exactly a restored path, or
-    local state inside a path the restore must recreate as a file. Harmless ignored caches
-    elsewhere do not collide. ``None`` when Git state is indeterminate (caller refuses)."""
+    path. Collisions are: a local ignored/untracked file at exactly a restored path, local
+    state inside a path the restore must recreate as a file, or a local file blocking a
+    path the restore must recreate as a directory. Harmless ignored caches elsewhere do
+    not collide. ``None`` when Git state is indeterminate (caller refuses)."""
     delta = _git_run(
         git_cmd, ["diff", "--name-only", "-z", "--no-renames", expected_sha, pre_pull_sha],
         _m().PROJECT_ROOT)
@@ -752,7 +753,10 @@ def _pinned_rollback_collisions(git_cmd, expected_sha: str, pre_pull_sha) -> "li
         if path.endswith("/"):
             # An ignored empty/shared directory is not itself overwritten.
             continue
-        if any(path == target or path.startswith(target + "/") for target in targets):
+        if any(
+            path == target or path.startswith(target + "/") or target.startswith(path + "/")
+            for target in targets
+        ):
             collisions.append(path)
     return collisions
 

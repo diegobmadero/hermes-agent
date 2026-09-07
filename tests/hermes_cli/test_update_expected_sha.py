@@ -991,6 +991,46 @@ def test_pinned_rollback_refuses_ignored_directory_obstruction(
     assert graph.pinned in out and graph.base in out
 
 
+def test_pinned_rollback_refuses_ignored_file_blocking_restored_directory(
+    git_isolation, tmp_path, monkeypatch, capsys
+):
+    """Inverse obstruction: the restore recreates a directory path where an
+    ignored local FILE sits — reset --hard would silently delete those bytes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    (repo / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (repo / "cache" / "sub").mkdir(parents=True)
+    (repo / "cache" / "sub" / "x.txt").write_text("tracked payload\n", encoding="utf-8")
+    (repo / "cli.py").write_text("print('valid fixture')\n", encoding="utf-8")
+    _git(repo, "add", "-f", "cache/sub/x.txt")
+    _git(repo, "add", ".gitignore", "cli.py")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pre-update")
+    base = _git_sha(repo)
+    _git(repo, "rm", "-q", "cache/sub/x.txt")
+    (repo / "cli.py").write_text("def broken(:\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-m", "pinned bad syntax")
+    pinned = _git_sha(repo)
+    # Local process recreates the ignored cache with a FILE where the restore
+    # needs the directory cache/sub/.
+    (repo / "cache").mkdir(exist_ok=True)
+    (repo / "cache" / "sub").write_text("blocking local bytes\n", encoding="utf-8")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_update_cmd._rollback_if_pulled_syntax_error(["git"], base, expected_sha=pinned)
+
+    assert _git_sha(repo) == pinned
+    assert (repo / "cache" / "sub").is_file()
+    assert (repo / "cache" / "sub").read_text(encoding="utf-8") == "blocking local bytes\n"
+    out = capsys.readouterr().out
+    assert "Refusing automatic rollback" in out
+    assert pinned in out and base in out
+
+
 def test_pinned_rollback_allows_harmless_noncolliding_ignored_cache(
     git_isolation, tmp_path, monkeypatch
 ):
