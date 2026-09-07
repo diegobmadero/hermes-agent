@@ -433,6 +433,15 @@ class TestBuildSkillsSystemPrompt:
         assert build_skills_system_prompt(index_mode="off") == ""
         assert "pepchat" in build_skills_system_prompt(index_mode="full")
 
+        # The index is prompt disclosure policy, not a load gate: a skill the
+        # prompt never discloses still loads from the temporary library.
+        import json as _json
+
+        import tools.skills_tool as skills_tool
+        loaded = _json.loads(skills_tool.skill_view("pepchat", preprocess=False))
+        assert loaded["success"] is True
+        assert "Research PepChat" in loaded["content"]
+
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

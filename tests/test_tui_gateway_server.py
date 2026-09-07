@@ -4576,7 +4576,9 @@ def test_background_agent_kwargs_preserves_reasoning_override_provenance(monkeyp
         _reasoning_config_is_runtime_override=True,
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    # _background_agent_kwargs passes the platform ("tui"); accept it like the
+    # sibling fakes do (lambda *_a, **_kw).
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     kwargs = server._background_agent_kwargs(agent, "task-id")

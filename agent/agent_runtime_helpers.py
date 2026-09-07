@@ -386,7 +386,7 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
         # after the chokepoint fix (#77921). Popping is non-destructive: an empty array carries no
         # information.
         prev.pop("tool_calls", None)
-    # Concatenate plain-text content only; leave multimodal (list) content alone.
+    # Concatenate text content; multimodal (list) content merges below as ordered content parts.
     prev_content = prev.get("content")
     new_content = msg.get("content")
     content_rewritten = False
@@ -429,12 +429,13 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     # substitutes it back in for role ``assistant``), so leaving it in place while ``prev["content"]``
     # changes would silently replay the pre-merge bytes and discard everything this merge just concatenated
     # on — the same stale-field-survives-the-merge shape as the ``tool_calls`` gap above, just for a
-    # different field. Only drop it when the merge actually changed the resulting value (e.g. the later
-    # turn's content is ``None``, or either side is multimodal/list — both branches skip the reassignment
-    # and ``prev["content"]`` is untouched; a falsy ``new_content`` that strips to nothing also leaves
-    # ``joined`` equal to the original ``prev_content``): in those cases the sidecar is still the exact
-    # bytes previously sent for the UNCHANGED content, and dropping it would break the prompt-cache replay
-    # invariant for no reason (wz-heng, #78063 review).
+    # different field. Only drop it when the merge actually changed the resulting value. It is NOT a
+    # rewrite — and the sidecar stays — when the later turn's content is ``None`` (no reassignment),
+    # when a multimodal merge reproduces the original part list exactly (degenerate ``new_content``),
+    # or when a falsy ``new_content`` strips to nothing and leaves ``joined`` equal to the original
+    # ``prev_content``: in those cases the sidecar is still the exact bytes previously sent for the
+    # UNCHANGED content, and dropping it would break the prompt-cache replay invariant for no reason
+    # (wz-heng, #78063 review).
     if content_rewritten:
         drop_stale_api_content(prev)
 

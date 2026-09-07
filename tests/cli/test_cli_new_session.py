@@ -204,7 +204,10 @@ def test_new_session_clears_runtime_reasoning_and_restores_per_model_config(tmp_
     cli.agent._reasoning_config_is_runtime_override = True
     cli.conversation_history = []
 
-    with patch.dict(cli.new_session.__func__.__globals__, {"CLI_CONFIG": config}):
+    # new_session resolves CLI_CONFIG from the cli module at call time; patch
+    # THAT binding (patching the mixin's __globals__ would be a no-op).
+    import cli as cli_mod
+    with patch.object(cli_mod, "CLI_CONFIG", config):
         cli.new_session(silent=True)
 
     expected = {"enabled": True, "effort": "high"}

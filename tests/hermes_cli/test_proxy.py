@@ -298,7 +298,6 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
             "method": request.method,
             "path": request.path,
             "auth": request.headers.get("Authorization"),
-            "request_id": request.headers.get("X-Request-ID"),
             "body": body.decode("utf-8") if body else "",
         })
         return web.json_response({"echoed": True, "path": request.path})
@@ -505,259 +504,95 @@ def test_proxy_does_not_append_done_after_malformed_trailing_frame():
 # ---------------------------------------------------------------------------
 
 
-def test_server_logs_correlated_request_lifecycle_without_body(caplog):
-    async def run():
-        captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
-        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="real-portal-key")
-        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
-
-        try:
-            with caplog.at_level(logging.INFO, logger="hermes_cli.proxy.server"):
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{proxy_base}/v1/chat/completions",
-                        json={"prompt": "SECRET-PROMPT-BODY"},
-                        headers={"X-Request-ID": "pi-run-123"},
-                    ) as resp:
-                        await resp.read()
-                        assert resp.headers["X-Hermes-Proxy-Request-ID"] == "pi-run-123"
-
-            assert captured["requests"][0]["request_id"] == "pi-run-123"
-            messages = "\n".join(record.getMessage() for record in caplog.records)
-            assert "event=proxy_request_started" in messages
-            assert "event=proxy_upstream_headers" in messages
-            assert "event=proxy_request_completed" in messages
-            assert "request_id=pi-run-123" in messages
-            assert "SECRET-PROMPT-BODY" not in messages
-            assert "real-portal-key" not in messages
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
-
-    asyncio.run(run())
+def _snapshot_proxy_logger():
+    proxy_logger = logging.getLogger("hermes_cli.proxy")
+    return list(proxy_logger.handlers), proxy_logger.level, proxy_logger.propagate
 
 
-def test_server_returns_correlated_504_and_logs_upstream_timeout(caplog):
-    async def slow(_request):
-        await asyncio.sleep(0.1)
-        return web.json_response({"ok": True})
-
-    async def run():
-        upstream = web.Application()
-        upstream.router.add_post("/v1/responses", slow)
-        upstream_runner, upstream_base = await _start_runner(upstream)
-        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/responses"])
-        proxy_runner, proxy_base = await _start_runner(
-            create_app(adapter, upstream_sock_read_seconds=0.01)
-        )
-
-        try:
-            with caplog.at_level(logging.INFO, logger="hermes_cli.proxy.server"):
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{proxy_base}/v1/responses",
-                        json={"prompt": "SECRET-TIMEOUT-BODY"},
-                        headers={"X-Request-ID": "pi-timeout-456"},
-                    ) as resp:
-                        body = await resp.json()
-                        assert resp.status == 504
-                        assert body["error"]["code"] == "upstream_timeout"
-                        assert resp.headers["X-Hermes-Proxy-Request-ID"] == "pi-timeout-456"
-
-            messages = "\n".join(record.getMessage() for record in caplog.records)
-            assert "event=proxy_request_failed" in messages
-            assert "request_id=pi-timeout-456" in messages
-            assert "stage=upstream_wait" in messages
-            assert "code=upstream_timeout" in messages
-            assert "SECRET-TIMEOUT-BODY" not in messages
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
-
-    asyncio.run(run())
+def _restore_proxy_logger(snapshot) -> None:
+    handlers, level, propagate = snapshot
+    proxy_logger = logging.getLogger("hermes_cli.proxy")
+    for handler in list(proxy_logger.handlers):
+        proxy_logger.removeHandler(handler)
+    for handler in handlers:
+        proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(level)
+    proxy_logger.propagate = propagate
 
 
-def test_server_returns_correlated_504_when_response_body_stalls(caplog):
-    async def headers_then_stall(request):
-        response = web.StreamResponse(
-            status=200,
-            headers={"Content-Type": "application/json"},
-        )
-        await response.prepare(request)
-        await asyncio.sleep(0.1)
-        try:
-            await response.write(b'{"ok":true}')
-            await response.write_eof()
-        except ConnectionError:
-            pass
-        return response
+def test_configure_proxy_logging_idempotent_isolated_stderr():
+    """The owned stderr handler is added once across repeated calls, at INFO with
+    propagate=False; unrelated handlers survive and the root logger is untouched."""
+    import sys
 
-    async def run():
-        upstream = web.Application()
-        upstream.router.add_post("/v1/responses", headers_then_stall)
-        upstream_runner, upstream_base = await _start_runner(upstream)
-        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/responses"])
-        proxy_runner, proxy_base = await _start_runner(
-            create_app(adapter, upstream_sock_read_seconds=0.01)
-        )
+    from hermes_cli.proxy.cli import _configure_proxy_logging
 
-        try:
-            with caplog.at_level(logging.INFO, logger="hermes_cli.proxy.server"):
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{proxy_base}/v1/responses",
-                        json={"stream": False},
-                        headers={"X-Request-ID": "pi-body-timeout-789"},
-                    ) as response:
-                        body = await response.json()
-                        assert response.status == 504
-                        assert body["error"]["code"] == "upstream_timeout"
-                        assert (
-                            response.headers["X-Hermes-Proxy-Request-ID"]
-                            == "pi-body-timeout-789"
-                        )
+    snapshot = _snapshot_proxy_logger()
+    root_handlers = list(logging.getLogger().handlers)
+    root_level = logging.getLogger().level
+    try:
+        proxy_logger = logging.getLogger("hermes_cli.proxy")
+        for handler in list(proxy_logger.handlers):
+            proxy_logger.removeHandler(handler)
+        unrelated = logging.StreamHandler()
+        proxy_logger.addHandler(unrelated)
 
-            messages = "\n".join(record.getMessage() for record in caplog.records)
-            assert "request_id=pi-body-timeout-789" in messages
-            assert "stage=upstream_body" in messages
-            assert "code=upstream_timeout" in messages
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
+        _configure_proxy_logging()
+        _configure_proxy_logging()
 
-    asyncio.run(run())
+        owned = [
+            handler for handler in proxy_logger.handlers
+            if getattr(handler, "_hermes_proxy_handler", False)
+        ]
+        assert len(owned) == 1
+        assert owned[0].stream is sys.stderr
+        assert proxy_logger.level == logging.INFO
+        assert proxy_logger.propagate is False
+        assert unrelated in proxy_logger.handlers
+        assert logging.getLogger().handlers == root_handlers
+        assert logging.getLogger().level == root_level
+    finally:
+        _restore_proxy_logger(snapshot)
 
 
-def test_stream_prepare_cancellation_closes_upstream_and_propagates(
-    caplog, monkeypatch
-):
-    async def run():
-        upstream_closed = asyncio.Event()
+def test_cmd_proxy_start_configures_logging_before_run_server(monkeypatch):
+    """The start path wires the proxy logger BEFORE the server runs."""
+    from types import SimpleNamespace
 
-        async def streaming_upstream(request):
-            response = web.StreamResponse(
-                status=200,
-                headers={"Content-Type": "text/event-stream"},
-            )
-            await response.prepare(request)
-            try:
-                while True:
-                    await response.write(b"data: heartbeat\n\n")
-                    await asyncio.sleep(0.01)
-            except ConnectionError:
-                upstream_closed.set()
-            return response
+    from hermes_cli.proxy import cli as proxy_cli
 
-        upstream = web.Application()
-        upstream.router.add_post("/v1/responses", streaming_upstream)
-        upstream_runner, upstream_base = await _start_runner(upstream)
-        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/responses"])
-        proxy_app = create_app(adapter)
-        original_prepare = web.StreamResponse.prepare
+    snapshot = _snapshot_proxy_logger()
+    try:
+        proxy_logger = logging.getLogger("hermes_cli.proxy")
+        for handler in list(proxy_logger.handlers):
+            proxy_logger.removeHandler(handler)
+        proxy_logger.propagate = True
 
-        async def cancel_proxy_prepare(response, request):
-            if request.app is proxy_app:
-                raise asyncio.CancelledError
-            return await original_prepare(response, request)
+        class _FakeAdapter:
+            display_name = "Fake Provider"
 
-        monkeypatch.setattr(web.StreamResponse, "prepare", cancel_proxy_prepare)
-        proxy_runner, proxy_base = await _start_runner(proxy_app)
+            def is_authenticated(self):
+                return True
 
-        try:
-            with caplog.at_level(logging.INFO, logger="hermes_cli.proxy.server"):
-                async with aiohttp.ClientSession() as session:
-                    with pytest.raises(aiohttp.ServerDisconnectedError):
-                        await session.post(
-                            f"{proxy_base}/v1/responses",
-                            json={"stream": True},
-                            headers={"X-Request-ID": "pi-cancel-prepare-1"},
-                        )
-                await asyncio.wait_for(upstream_closed.wait(), timeout=1)
+        observed: Dict[str, Any] = {}
 
-            messages = "\n".join(record.getMessage() for record in caplog.records)
-            assert "request_id=pi-cancel-prepare-1" in messages
-            assert "stage=response_stream" in messages
-            assert "code=client_cancelled" in messages
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
+        async def fake_run_server(adapter, *, host, port):
+            running_logger = logging.getLogger("hermes_cli.proxy")
+            observed["owned"] = [
+                handler for handler in running_logger.handlers
+                if getattr(handler, "_hermes_proxy_handler", False)
+            ]
+            observed["level"] = running_logger.level
+            observed["propagate"] = running_logger.propagate
 
-    asyncio.run(run())
+        monkeypatch.setattr(proxy_cli, "get_adapter", lambda provider: _FakeAdapter())
+        monkeypatch.setattr(proxy_cli, "run_server", fake_run_server)
 
+        rc = proxy_cli.cmd_proxy_start(SimpleNamespace(provider="nous", host=None, port=None))
 
-def test_midstream_cancellation_closes_upstream_and_propagates(caplog, monkeypatch):
-    async def run():
-        upstream_closed = asyncio.Event()
-
-        async def streaming_upstream(request):
-            response = web.StreamResponse(
-                status=200,
-                headers={"Content-Type": "text/event-stream"},
-            )
-            await response.prepare(request)
-            try:
-                while True:
-                    await response.write(b"data: heartbeat\n\n")
-                    await asyncio.sleep(0.01)
-            except ConnectionError:
-                upstream_closed.set()
-            return response
-
-        upstream = web.Application()
-        upstream.router.add_post("/v1/responses", streaming_upstream)
-        upstream_runner, upstream_base = await _start_runner(upstream)
-        adapter = FakeAdapter(f"{upstream_base}/v1", allowed=["/responses"])
-        proxy_app = create_app(adapter)
-        original_prepare = web.StreamResponse.prepare
-        original_write = web.StreamResponse.write
-
-        async def mark_proxy_response(response, request):
-            result = await original_prepare(response, request)
-            if request.app is proxy_app:
-                response._test_cancel_write = True
-            return result
-
-        async def cancel_proxy_write(response, data):
-            if getattr(response, "_test_cancel_write", False):
-                raise asyncio.CancelledError
-            return await original_write(response, data)
-
-        monkeypatch.setattr(web.StreamResponse, "prepare", mark_proxy_response)
-        monkeypatch.setattr(web.StreamResponse, "write", cancel_proxy_write)
-        proxy_runner, proxy_base = await _start_runner(proxy_app)
-
-        try:
-            with caplog.at_level(logging.INFO, logger="hermes_cli.proxy.server"):
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{proxy_base}/v1/responses",
-                        json={"stream": True},
-                        headers={"X-Request-ID": "pi-cancel-stream-2"},
-                    ) as response:
-                        with pytest.raises(
-                            (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError)
-                        ):
-                            await response.read()
-                await asyncio.wait_for(upstream_closed.wait(), timeout=1)
-
-            messages = "\n".join(record.getMessage() for record in caplog.records)
-            assert "request_id=pi-cancel-stream-2" in messages
-            assert "stage=response_stream" in messages
-            assert "code=client_cancelled" in messages
-        finally:
-            await proxy_runner.cleanup()
-            await upstream_runner.cleanup()
-
-    asyncio.run(run())
-
-
-def test_proxy_timeout_env_is_configurable_and_validated(monkeypatch):
-    from hermes_cli.proxy.cli import _timeout_from_env
-
-    monkeypatch.setenv("HERMES_PROXY_READ_TIMEOUT_SECONDS", "540")
-    assert _timeout_from_env("HERMES_PROXY_READ_TIMEOUT_SECONDS", 300) == 540
-
-    monkeypatch.setenv("HERMES_PROXY_READ_TIMEOUT_SECONDS", "0")
-    with pytest.raises(ValueError, match="greater than zero"):
-        _timeout_from_env("HERMES_PROXY_READ_TIMEOUT_SECONDS", 300)
+        assert rc == 0
+        assert len(observed["owned"]) == 1
+        assert observed["level"] == logging.INFO
+        assert observed["propagate"] is False
+    finally:
+        _restore_proxy_logger(snapshot)

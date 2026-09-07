@@ -43,3 +43,64 @@ def test_python_cli_with_literal_lifecycle_command_is_still_blocked(
         )
         is True
     )
+
+
+def test_python_cli_via_interpreter_invocation_is_allowed(tmp_path: Path) -> None:
+    """The live incident shape: ``python3 ~/bin/ask_agent.py`` from Telegram."""
+    cache = tmp_path / "jobs"
+    cache.mkdir()
+    script = tmp_path / "ask_agent.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f'JOBS = Path("{cache}")\n'
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+    assert (
+        contains_gateway_lifecycle_command_or_referenced_script(
+            f"python3 {script} --jobs", cwd=str(tmp_path)
+        )
+        is False
+    )
+
+
+def test_suffixless_symlink_to_python_cli_is_allowed(tmp_path: Path) -> None:
+    """A suffixless launcher symlink resolves to a .py target: the exemption
+    must apply via the RESOLVED path's suffix, not the link's name."""
+    cache = tmp_path / "jobs"
+    cache.mkdir()
+    script = tmp_path / "ask_agent.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f'JOBS = Path("{cache}")\n'
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+    link = tmp_path / "ask_agent"
+    link.symlink_to(script)
+    assert (
+        contains_gateway_lifecycle_command_or_referenced_script(
+            str(link), cwd=str(tmp_path)
+        )
+        is False
+    )
+
+
+def test_suffixless_symlink_to_python_with_lifecycle_literal_is_blocked(
+    tmp_path: Path,
+) -> None:
+    """The exemption inspects the resolved Python source with the direct scan;
+    a literal lifecycle string is still refused — read, never executed."""
+    script = tmp_path / "evil.py"
+    script.write_text(
+        'import os\nos.system("hermes gateway restart")\n',
+        encoding="utf-8",
+    )
+    link = tmp_path / "evilcli"
+    link.symlink_to(script)
+    assert (
+        contains_gateway_lifecycle_command_or_referenced_script(
+            str(link), cwd=str(tmp_path)
+        )
+        is True
+    )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 from typing import Any
 
@@ -58,13 +57,7 @@ def cmd_proxy_start(args: Any) -> int:
     )
     _configure_proxy_logging()
     try:
-        asyncio.run(
-            run_server(
-                adapter,
-                host=host,
-                port=port,
-            )
-        )
+        asyncio.run(run_server(adapter, host=host, port=port))
     except KeyboardInterrupt:
         _err("\nproxy: stopped")
     except OSError as exc:

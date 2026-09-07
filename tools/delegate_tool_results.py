@@ -396,10 +396,7 @@ def _finalize_child_results(
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
         _apply_summary_budget(results, parent_agent)
-        # children tuples are (index, task, child) from the plugin lifecycle
-        # and (index, task, child, timeout) from delegate_task — index by
-        # position so both shapes finalize identically.
-        child_by_index = {entry[0]: entry[2] for entry in children}
+        child_by_index = {index: child for index, _task, child in children}
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)
         _rollup_children_cost(parent_agent, _fire_subagent_stop_hooks(results, child_by_index, parent_agent))
 

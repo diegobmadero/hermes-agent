@@ -476,6 +476,9 @@ class TestDelegateTask(unittest.TestCase):
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["api_mode"], "anthropic_messages")
 
+class TestToolNamePreservation(unittest.TestCase):
+    """Verify _last_resolved_tool_names is restored after subagent runs."""
+
     def test_global_tool_names_restored_after_delegation(self):
         """The process-global _last_resolved_tool_names must be restored
         after a subagent completes so the parent's execute_code sandbox
@@ -1578,6 +1581,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"got {len(touch_calls)} touches",
         )
 
+
+class TestDelegationReasoningEffort(unittest.TestCase):
+    """Tests for delegation.reasoning_effort config override."""
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")

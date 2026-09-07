@@ -36,6 +36,10 @@ def test_drop_scaffolding_rewinds_orphan_tool_tail():
     assert messages == [{"role": "user", "content": "task"}]
 
 
+
+
+
+
 # ── _repair_message_sequence ───────────────────────────────────────────────
 
 def test_repair_merges_consecutive_user_messages():
@@ -151,6 +155,18 @@ def test_repair_keeps_tool_matching_only_call_id():
 
     assert repairs == 0
     assert any(m.get("role") == "tool" for m in messages)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_repair_keeps_tool_result_keyed_by_response_item_id():
@@ -395,6 +411,7 @@ def test_repair_merge_multimodal_degenerate_keeps_sidecar():
     assert messages[1]["api_content"] == "wire bytes"
 
 
+
 def test_sanitize_consumes_all_responses_id_variants_for_duplicate_result():
     """A sibling-id replay must not replace the first real result."""
     from agent.agent_runtime_helpers import sanitize_api_messages
@@ -434,6 +451,7 @@ def test_tool_executor_uses_canonical_responses_pairing_id():
     assert _pairing_tool_call_id(
         SimpleNamespace(id="call_ABC|fc_123")
     ) == "call_ABC"
+
 
 
 # ── repair_message_sequence_with_cursor (#44837) ───────────────────────────
@@ -479,6 +497,9 @@ def test_cursor_rewinds_when_compaction_happens_before_cursor():
     assert messages[agent._last_flushed_db_idx] is unflushed_assistant
 
 
+
+
+
 def test_flush_guard_clamps_overshooting_cursor():
     """_flush_messages_to_session_db safety net: an overshooting cursor must
     not produce a negative-start slice that skips everything (#44837)."""
@@ -515,9 +536,19 @@ def test_flush_guard_clamps_overshooting_cursor():
 # ── Pass 0: merge consecutive assistant messages (issue #29148, #49147) ─────
 
 
+
+
+
+
+
+
+
+
 # ── tool_call_id de-duplication (#58327) ────────────────────────────────────
 # Strict providers (DeepSeek) reject a payload where the same tool_call_id
 # appears more than once with HTTP 400 "Duplicate value for 'tool_call_id'".
+
+
 
 
 def test_sanitize_deduplicates_duplicate_tool_results():
@@ -811,6 +842,10 @@ def test_repair_keeps_tool_result_when_tool_calls_are_sdk_objects():
     assert "tool" in roles, "legitimate tool result was dropped as a false orphan"
     tool_msg = next(m for m in messages if m.get("role") == "tool")
     assert tool_msg["content"] == "file contents"
+
+
+
+
 
 
 # ── Self-recovery: heal empty-content non-final messages ──────────────────

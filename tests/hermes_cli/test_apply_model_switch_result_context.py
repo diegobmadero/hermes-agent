@@ -32,6 +32,16 @@ class _FakeModelInfo:
 
 class _StubCLI:
     """Minimum attrs ``_apply_model_switch_result`` reads on ``self``."""
+    def _stage_and_swap_model(self, result, old_model):
+        # Staging + in-place swap lives in a helper; run the real one on this stub.
+        import cli as _cli_mod
+        return _cli_mod.HermesCLI._stage_and_swap_model(self, result, old_model)
+
+    def _sync_reasoning_state_from_agent(self):
+        # Bind the real mixin behavior; never copy its implementation here.
+        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+        return CLIModelSwitchMixin._sync_reasoning_state_from_agent(self)
+
     agent: Any = None
     conversation_history: list = []
     reasoning_config: dict | None = None
@@ -45,14 +55,6 @@ class _StubCLI:
     _explicit_base_url = ""
     api_mode = ""
     _pending_model_switch_note = ""
-
-    def _sync_reasoning_state_from_agent(self):
-        if self.agent is None:
-            return
-        self.reasoning_config = self.agent.reasoning_config
-        self._reasoning_config_is_runtime_override = bool(
-            self.agent._reasoning_config_is_runtime_override
-        )
 
 
 def _run_display(monkeypatch, result):
