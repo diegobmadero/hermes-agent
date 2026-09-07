@@ -1079,3 +1079,44 @@ def test_pinned_update_rollback_refuses_ignored_collision_at_command_boundary(
     assert latest["outcome"] == "failed"
     assert latest["exit_code"] == 1
 
+
+
+def test_pinned_update_zero_count_but_wrong_head_refuses_before_repair(
+    git_isolation, update_seams, tmp_path, monkeypatch, capsys
+):
+    """Zero new commits counted while HEAD is no longer the pin (a raced local
+    commit landed after the ancestry proof): refuse before repair/install, keep
+    local state, failed receipt."""
+    graph = _build_pinned_graph(tmp_path)
+    _git(graph.work, "reset", "--hard", graph.second)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", graph.work)
+
+    def racing_run(cmd, **kwargs):
+        result = _REAL_RUN(cmd, **kwargs)
+        if list(cmd) == ["git", "merge-base", "--is-ancestor", "HEAD", graph.second]:
+            # Another local writer commits on the branch after the ancestry proof;
+            # HEAD is now one ahead of the pin, so the count reads zero.
+            _git(
+                graph.work,
+                "-c", "user.name=Hermes Test", "-c", "user.email=hermes-test@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "raced commit")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", racing_run)
+    raced_head = None
+
+    with pytest.raises(SystemExit) as exc_info:
+        try:
+            hermes_main.cmd_update(_update_args(graph.branch, graph.second))
+        finally:
+            raced_head = _git_sha(graph.work)
+
+    assert exc_info.value.code == 1
+    # The raced local commit is exactly what HEAD still points at: nothing was reset.
+    assert _git_sha(graph.work, graph.branch) == raced_head
+    assert _git(graph.work, "log", "-1", "--format=%s").stdout.strip() == "raced commit"
+    assert update_seams.installs == [] and update_seams.repairs == []
+    assert "HEAD does not match expected SHA" in capsys.readouterr().out
+    latest = update_receipt.read_latest_receipt()
+    assert latest is not None
+    assert latest["outcome"] == "failed"

@@ -411,6 +411,71 @@ def test_repair_merge_multimodal_degenerate_keeps_sidecar():
     assert messages[1]["api_content"] == "wire bytes"
 
 
+def test_repair_merge_combined_attachments_tool_union_and_tool_result_association():
+    """The charter's combined case at the repair entrypoint: consecutive assistant
+    turns with list/list content and NON-TEXT attachment parts on both sides merge
+    in original order; tool_calls union; the following tool results stay attached
+    to the merged turn (the merge pass runs before stray-result detection so the
+    unioned ids are known); the rewritten content invalidates the stale sidecar."""
+    agent = _bare_agent()
+    image_a = {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUFB"}}
+    audio_b = {"type": "input_audio", "input_audio": {"data": "QkJC", "format": "wav"}}
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant",
+         "content": [{"type": "text", "text": "first"}, image_a],
+         "tool_calls": [{"id": "call_a", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}],
+         "api_content": "wire bytes A"},
+        {"role": "assistant",
+         "content": [{"type": "text", "text": "second"}, audio_b],
+         "tool_calls": [{"id": "call_b", "type": "function",
+                         "function": {"name": "web_search", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "file body"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "search hits"},
+        {"role": "user", "content": "next"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 1
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "tool", "user"]
+    merged = messages[1]
+    assert merged["content"] == [
+        {"type": "text", "text": "first"}, image_a,
+        {"type": "text", "text": "second"}, audio_b,
+    ]
+    assert [call["id"] for call in merged["tool_calls"]] == ["call_a", "call_b"]
+    assert "api_content" not in merged
+    # Tool results survived and stay bound to the merged turn's calls.
+    assert messages[2]["tool_call_id"] == "call_a" and messages[2]["content"] == "file body"
+    assert messages[3]["tool_call_id"] == "call_b" and messages[3]["content"] == "search hits"
+
+
+def test_repair_never_collapses_codex_interim_turns():
+    """Codex interim control: a turn carrying its own continuation state is
+    replayed verbatim, never folded into its assistant neighbor."""
+    agent = _bare_agent()
+    interim = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "interim"}],
+        "codex_reasoning_items": [{"type": "reasoning", "id": "rs_1"}],
+        "api_content": "interim wire bytes",
+    }
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "final answer"},
+        interim,
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages[1] == {"role": "assistant", "content": "final answer"}
+    assert messages[2] is interim
+    assert messages[2]["api_content"] == "interim wire bytes"
+
+
 
 def test_sanitize_consumes_all_responses_id_variants_for_duplicate_result():
     """A sibling-id replay must not replace the first real result."""
