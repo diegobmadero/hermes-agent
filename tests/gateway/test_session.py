@@ -156,6 +156,7 @@ class TestBuildSessionContextPrompt:
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
         assert "brief spoken status" in p1
+        assert "under ten words" in p1
         assert "Do not narrate every tool call" in p1
         assert "private reasoning" in p1
 
