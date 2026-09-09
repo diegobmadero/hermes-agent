@@ -18,7 +18,7 @@ import queue
 import sys
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -149,6 +149,51 @@ class TestStreamingSpeechChild:
         child.append(b"\x01" * vm.FRAME_SIZE)
         assert child.read_frame() is None
 
+    def test_buffer_backpressures_and_abort_releases_blocked_writer(self):
+        child = vm.StreamingSpeechChild(
+            fade_in_ms=0,
+            max_buffer_bytes=vm.FRAME_SIZE,
+        )
+        frame = b"\x01\x00" * (vm.FRAME_SIZE // 2)
+        child.append(frame)
+        writer_done = threading.Event()
+
+        def write_second_frame():
+            child.append(frame)
+            writer_done.set()
+
+        writer = threading.Thread(target=write_second_frame)
+        writer.start()
+        assert writer_done.wait(0.05) is False
+        with child._lock:
+            assert len(child._buf) <= vm.FRAME_SIZE
+
+        child.abort()
+        assert writer_done.wait(1.0) is True
+        writer.join(timeout=1.0)
+        assert child.finished is True
+        assert child.read_frame() is None
+
+    def test_mixer_cleanup_aborts_child_and_releases_blocked_writer(self):
+        child = vm.StreamingSpeechChild(max_buffer_bytes=vm.FRAME_SIZE)
+        frame = b"\x01\x00" * (vm.FRAME_SIZE // 2)
+        child.append(frame)
+        writer_done = threading.Event()
+        writer = threading.Thread(
+            target=lambda: (child.append(frame), writer_done.set()),
+            daemon=True,
+        )
+        writer.start()
+        assert writer_done.wait(0.05) is False
+
+        mixer = vm.VoiceMixer()
+        mixer.play_speech_stream(child)
+        mixer.cleanup()
+
+        assert writer_done.wait(1.0) is True
+        writer.join(timeout=1.0)
+        assert child.finished is True
+
 
 # =====================================================================
 # Adapter sink
@@ -168,7 +213,12 @@ def _make_adapter(*, voice_fx=None, guild_id=111, chat_id="222", connected=True)
     adapter._voice_clients = {}
     adapter._voice_locks = {}
     adapter._voice_text_channels = {}
+    adapter._voice_timeout_tasks = {}
+    adapter._voice_receivers = {}
+    adapter._voice_listen_tasks = {}
+    adapter._voice_sources = {}
     adapter._voice_mixers = {}
+    adapter._streaming_tts_handles = {}
     adapter._ambient_pcm_cache = None
     adapter._voice_fx_cfg = voice_fx if voice_fx is not None else {
         "enabled": False, "ambient_enabled": True, "ambient_path": "",
@@ -178,6 +228,7 @@ def _make_adapter(*, voice_fx=None, guild_id=111, chat_id="222", connected=True)
         vc = MagicMock()
         vc.is_connected.return_value = True
         vc.is_playing.return_value = False
+        vc.disconnect = AsyncMock()
         adapter._voice_clients[guild_id] = vc
         adapter._voice_text_channels[guild_id] = int(chat_id)
     return adapter
@@ -208,6 +259,25 @@ class TestSinkGating:
         adapter = _make_adapter()
         assert adapter.supports_streaming_tts("222", AudioFormat()) is True
 
+    def test_exact_format_gate_and_lazy_first_write_start(self):
+        adapter = _make_adapter()
+        unsupported = AudioFormat(sample_rate=48000, channels=1, sample_width=2)
+        assert adapter.supports_streaming_tts("222", unsupported) is False
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            assert handle is not None
+            assert handle.started is False
+            assert adapter._voice_mixers == {}
+            adapter._voice_clients[111].play.assert_not_called()
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            return handle
+
+        handle = asyncio.run(run())
+        assert handle.started is True
+        adapter._voice_clients[111].play.assert_called_once()
+        assert adapter._streaming_tts_handles[111] is handle
+
     def test_unsupported_for_other_chats(self):
         adapter = _make_adapter()
         assert adapter.supports_streaming_tts("999", AudioFormat()) is False
@@ -226,7 +296,9 @@ class TestBeginStreamingTTS:
         adapter = _make_adapter()  # voice_fx enabled=False
 
         async def run():
-            return await adapter.begin_streaming_tts("222", AudioFormat())
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            return handle
 
         handle = asyncio.run(run())
         assert handle is not None
@@ -244,7 +316,9 @@ class TestBeginStreamingTTS:
         adapter._voice_mixers[111] = existing
 
         async def run():
-            return await adapter.begin_streaming_tts("222", AudioFormat())
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            return handle
 
         handle = asyncio.run(run())
         assert handle is not None
@@ -257,7 +331,9 @@ class TestBeginStreamingTTS:
         })
 
         async def run():
-            return await adapter.begin_streaming_tts("222", AudioFormat())
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            return handle
 
         handle = asyncio.run(run())
         assert handle is not None
@@ -267,12 +343,72 @@ class TestBeginStreamingTTS:
         adapter = _make_adapter(voice_fx={"enabled": False, "lead_silence_ms": 100})
 
         async def run():
-            return await adapter.begin_streaming_tts("222", AudioFormat())
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            return handle
 
         handle = asyncio.run(run())
-        # 100ms of 48 kHz stereo s16 silence is already queued.
-        assert len(handle.child._buf) == 100 * vm.BYTES_PER_MS
-        assert set(handle.child._buf) == {0}
+        # The first write queues 100ms of lead silence before converted speech.
+        lead_bytes = 100 * vm.BYTES_PER_MS
+        assert len(handle.child._buf) > lead_bytes
+        assert set(handle.child._buf[:lead_bytes]) == {0}
+
+    def test_replacement_aborts_stale_owner_without_clearing_new_stream(self):
+        adapter = _make_adapter()
+
+        async def run():
+            stale = await adapter.begin_streaming_tts("222", AudioFormat())
+            current = await adapter.begin_streaming_tts("222", AudioFormat())
+            assert stale.aborted is True
+            assert adapter._streaming_tts_handles[111] is current
+
+            await adapter.write_streaming_tts(stale, b"\x10\x00" * 480)
+            adapter._voice_clients[111].play.assert_not_called()
+            await adapter.write_streaming_tts(current, b"\x10\x00" * 480)
+            adapter._voice_clients[111].play.assert_called_once()
+
+            await adapter.finish_streaming_tts(stale)
+            assert adapter._streaming_tts_handles[111] is current
+            await adapter.abort_streaming_tts(current, error="barge-in")
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
+
+    def test_first_write_never_preempts_racing_unrelated_audio(self):
+        adapter = _make_adapter()
+        vc = adapter._voice_clients[111]
+        vc.is_playing.side_effect = [False, True]
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            with pytest.raises(RuntimeError, match="mixer"):
+                await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            assert handle.audible is False
+
+        asyncio.run(run())
+        vc.stop.assert_not_called()
+
+    def test_drain_cleanup_is_identity_safe_and_leave_aborts_owner(self):
+        adapter = _make_adapter()
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            stale = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(stale, b"\x10\x00" * 480)
+            await adapter.finish_streaming_tts(stale)
+            assert stale.cleanup_task is not None
+
+            current = await adapter.begin_streaming_tts("222", AudioFormat())
+            await asyncio.sleep(0)
+            assert adapter._streaming_tts_handles[111] is current
+            await adapter.write_streaming_tts(current, b"\x20\x00" * 480)
+
+            await adapter.leave_voice_channel(111)
+            assert current.aborted is True
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
 
 
 class TestWriteFinishAbort:
