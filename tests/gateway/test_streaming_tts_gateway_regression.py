@@ -154,3 +154,85 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+class _FinalizationConsumer:
+    def __init__(self, *, audible: bool, task=None):
+        self.suppress_whole_file = audible
+        self.done = False
+        self._task = task
+        self.finish_count = 0
+        self.wait_count = 0
+        self.abort_reasons = []
+
+    def finish(self):
+        self.finish_count += 1
+
+    async def wait_complete(self, timeout):
+        self.wait_count += 1
+        return self.done
+
+    def abort(self, reason):
+        self.abort_reasons.append(reason)
+        self.done = True
+
+
+def test_audible_finalization_is_owned_without_turn_cleanup_abort():
+    async def run():
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner._background_tasks = set()
+        runner._draining = False
+        deferred = asyncio.create_task(asyncio.Event().wait())
+        consumer = _FinalizationConsumer(audible=True, task=deferred)
+        turn_ctx = SimpleNamespace(
+            streaming_tts_consumer_holder=[consumer],
+            stream_consumer_holder=[None],
+            session_key=None,
+            run_generation=None,
+        )
+        adapter = SimpleNamespace(_mark_streaming_tts_completed_turn=MagicMock())
+
+        await runner._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+        assert consumer.finish_count == 1
+        assert consumer.wait_count == 0
+        assert consumer.abort_reasons == []
+        assert deferred in runner._background_tasks
+
+        tracking = asyncio.create_task(asyncio.Event().wait())
+        await runner._run_agent_cleanup_turn_tasks(
+            turn_ctx,
+            progress_task=None,
+            log_task=None,
+            interrupt_monitor=None,
+            _notify_task=None,
+            tracking_task=tracking,
+            stream_task=None,
+        )
+        assert consumer.abort_reasons == []
+        assert deferred in runner._background_tasks
+
+        deferred.cancel()
+        await asyncio.gather(deferred, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_silent_finalization_retains_bounded_abort_for_fallback():
+    async def run():
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner._background_tasks = set()
+        consumer = _FinalizationConsumer(audible=False)
+        turn_ctx = SimpleNamespace(
+            streaming_tts_consumer_holder=[consumer],
+            session_key="discord:voice:1",
+            run_generation=7,
+        )
+
+        await runner._run_agent_finalize_streaming_tts(turn_ctx, adapter=None)
+
+        assert consumer.finish_count == 1
+        assert consumer.wait_count == 2
+        assert consumer.abort_reasons == ["streaming TTS finalisation timeout"]
+        assert runner._background_tasks == set()
+
+    asyncio.run(run())
+
+
