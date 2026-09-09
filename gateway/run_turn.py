@@ -3278,21 +3278,45 @@ class GatewayTurnMixin:
         if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent.model):
             self._evict_cached_agent(session_key)
 
+    @staticmethod
+    def _streaming_tts_should_abort_on_turn_end(stts: Any) -> bool:
+        """Only silent unfinished streams remain eligible for turn-end fallback abort."""
+        return bool(
+            stts is not None
+            and not getattr(stts, "done", True)
+            and not getattr(stts, "suppress_whole_file", False)
+        )
+
+    def _retain_audible_streaming_tts(self, stts: Any) -> None:
+        """Keep an audible consumer task under normal gateway shutdown ownership."""
+        task = getattr(stts, "_task", None)
+        if task is not None and not task.done():
+            getattr(self, "_retain_background_task")(task)
+
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
-        from run_sync). On drain timeout abort to free the task — audible streams keep whole-file
-        suppression, silent streams stay eligible for the whole-file fallback."""
+        from run_sync). Audible work remains gateway-owned after the text turn returns; silent work
+        keeps the bounded wait and abort path so whole-file fallback remains available."""
         _stts = turn_ctx.streaming_tts_consumer_holder[0]
         if _stts is None:
             return
         _stts.finish()
+        if _stts.suppress_whole_file:
+            self._retain_audible_streaming_tts(_stts)
+            if adapter is not None:
+                _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
+                if callable(_mark_turn):
+                    _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
+            return
         try:
             await _stts.wait_complete(timeout=10.0)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
-        if not _stts.done:
+        if self._streaming_tts_should_abort_on_turn_end(_stts):
             _stts.abort("streaming TTS finalisation timeout")
             await _stts.wait_complete(timeout=2.0)
+        elif not _stts.done and _stts.suppress_whole_file:
+            self._retain_audible_streaming_tts(_stts)
         if _stts.suppress_whole_file and adapter is not None:
             _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
             if callable(_mark_turn):
@@ -3554,13 +3578,19 @@ class GatewayTurnMixin:
             else:
                 await self._await_stream_task(stream_task)
 
-        # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
+        # Silent unfinished streams may still fall back to whole-file TTS. Audible streams keep
+        # running under gateway lifecycle ownership so turn cleanup cannot clip their queued tail.
         _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
-        # See #60671.
-        if _stts_finally is not None and not _stts_finally.done:
+        if self._streaming_tts_should_abort_on_turn_end(_stts_finally):
             _stts_finally.abort("cleanup")
             with suppress(Exception):
                 await _stts_finally.wait_complete(timeout=2.0)
+        elif (
+            _stts_finally is not None
+            and not _stts_finally.done
+            and _stts_finally.suppress_whole_file
+        ):
+            self._retain_audible_streaming_tts(_stts_finally)
 
         tracking_task.cancel()
         if session_key:
