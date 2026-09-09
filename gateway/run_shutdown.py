@@ -168,6 +168,15 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + self._active_streaming_tts_drain_count()
+        )
+
+    def _active_streaming_tts_drain_count(self) -> int:
+        """Audible TTS consumers retained after their text turn has returned."""
+        return sum(
+            1
+            for task in getattr(self, "_background_tasks", ())
+            if not task.done() and getattr(task, "_hermes_streaming_tts_drain", False)
         )
 
     @staticmethod

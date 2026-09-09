@@ -3278,11 +3278,31 @@ class GatewayTurnMixin:
             and not getattr(stts, "suppress_whole_file", False)
         )
 
+    async def _supervise_audible_streaming_tts(self, stts: Any) -> None:
+        """Bound the complete audible synthesis-plus-playback lifetime."""
+        timeout = max(0.1, float(getattr(self, "_streaming_tts_audible_timeout", 60.0)))
+        try:
+            if await stts.wait_complete(timeout=timeout):
+                return
+            stts.abort("audible streaming TTS liveness timeout")
+            await stts.wait_complete(timeout=2.0)
+        except asyncio.CancelledError:
+            if not getattr(stts, "done", False):
+                stts.abort("audible streaming TTS supervisor cancelled")
+            raise
+        except Exception as exc:
+            logger.debug("audible streaming TTS supervisor failed: %s", exc)
+            stts.abort("audible streaming TTS supervisor failed")
+
     def _retain_audible_streaming_tts(self, stts: Any) -> None:
-        """Keep an audible consumer task under normal gateway shutdown ownership."""
-        task = getattr(stts, "_task", None)
-        if task is not None and not task.done():
-            getattr(self, "_retain_background_task")(task)
+        """Keep one bounded audible-drain supervisor under gateway ownership."""
+        existing = getattr(stts, "_hermes_audible_drain_supervisor", None)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._supervise_audible_streaming_tts(stts))
+        setattr(task, "_hermes_streaming_tts_drain", True)
+        setattr(stts, "_hermes_audible_drain_supervisor", task)
+        getattr(self, "_retain_background_task")(task)
 
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
