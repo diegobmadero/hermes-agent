@@ -88,6 +88,18 @@ class FakeVoiceAdapter:
             handle.aborted = True
 
 
+class DelayedAbortVoiceAdapter(FakeVoiceAdapter):
+    def __init__(self):
+        super().__init__()
+        self.abort_started = asyncio.Event()
+        self.abort_release = asyncio.Event()
+
+    async def abort_streaming_tts(self, handle, error=None):
+        self.abort_started.set()
+        await self.abort_release.wait()
+        await super().abort_streaming_tts(handle, error)
+
+
 class SlowStreamer(FakeStreamer):
     """Fake streamer whose iteration intentionally blocks off the event loop."""
 
@@ -134,6 +146,11 @@ class BlockingSecondChunkStreamer(FakeStreamer):
         self.first_chunk_written = threading.Event()
         self.allow_remaining_chunks = threading.Event()
         self.finished = threading.Event()
+        self.cancel_count = 0
+
+    def cancel(self):
+        self.cancel_count += 1
+        self.allow_remaining_chunks.set()
 
     def stream(self, text: str):
         self.started.set()
@@ -191,6 +208,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._dropped = False
     consumer._suppress_whole_file = False
     consumer._task = None
+    consumer._abort_task = None
     consumer._lock = threading.Lock()
     consumer._strip_markdown = None
     return consumer
@@ -406,7 +424,7 @@ class TestConsumerLifecycle:
     def test_post_audio_timeout_keeps_suppression_then_aborts(self):
         """A bounded audible supervisor aborts the adapter and cancels its consumer task."""
         async def run(loop):
-            adapter = FakeVoiceAdapter()
+            adapter = DelayedAbortVoiceAdapter()
             streamer = BlockingSecondChunkStreamer()
             consumer = _make_consumer(adapter, "chat1", loop, streamer)
 
@@ -426,16 +444,25 @@ class TestConsumerLifecycle:
             assert adapter.written_chunks == [b"chunk-1-0"]
 
             consumer.abort("audible streaming TTS liveness timeout")
-            await consumer.wait_complete(timeout=2.0)
+            waiter = asyncio.create_task(consumer.wait_complete(timeout=2.0))
+            await asyncio.wait_for(adapter.abort_started.wait(), timeout=1.0)
             await asyncio.sleep(0)
+
+            assert waiter.done() is False
+            assert consumer._abort_task is not None
+            assert consumer._abort_task.done() is False
+
+            adapter.abort_release.set()
+            await waiter
 
             assert consumer.completed is False
             assert consumer._aborted is True
             assert consumer._task is not None
             assert consumer._task.cancelled() is True
+            assert consumer._abort_task.done() is True
             assert adapter.abort_count == 1
+            assert streamer.cancel_count == 1
             assert consumer.suppress_whole_file is True
-            streamer.allow_remaining_chunks.set()
             await asyncio.to_thread(streamer.finished.wait, 1.0)
 
         _run_test(run)
