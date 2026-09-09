@@ -945,8 +945,9 @@ class _DiscordStreamingTTSHandle(StreamingTTSHandle):
         self.child = child
         self.resample_carry = bytearray()
         self.started = False
+        self.receiver_paused = False
+        self.state_restored = False
         self.start_lock = asyncio.Lock()
-        self.cleanup_task: Optional[asyncio.Task] = None
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -3447,8 +3448,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if handle is not None:
                 handle.aborted = True
                 handle.child.abort()
-                if handle.cleanup_task is not None:
-                    handle.cleanup_task.cancel()
+                self._restore_streaming_tts_state(handle)
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:
@@ -3578,6 +3578,27 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             audio_format.sample_width,
         ) == (24000, 1, 2) and self._voice_guild_for_chat(chat_id) is not None
 
+    def _restore_streaming_tts_state(self, handle: _DiscordStreamingTTSHandle) -> None:
+        """Restore receiver and inactivity state once for one terminal stream path."""
+        if handle.state_restored:
+            return
+        handle.state_restored = True
+        if handle.receiver_paused:
+            receiver = getattr(self, "_voice_receivers", {}).get(handle.guild_id)
+            if receiver is not None:
+                receiver.resume()
+            handle.receiver_paused = False
+        if handle.started:
+            self._reset_voice_timeout(handle.guild_id)
+
+    async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
+        """Stop generic session activity and any streaming speech owned by this chat."""
+        await super().interrupt_session_activity(session_key, chat_id, metadata=metadata)
+        handles = getattr(self, "_streaming_tts_handles", {})
+        for handle in list(handles.values()):
+            if str(handle.chat_id) == str(chat_id):
+                await self.abort_streaming_tts(handle, error="session interrupted")
+
     async def begin_streaming_tts(
         self,
         chat_id: str,
@@ -3606,10 +3627,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if previous is not None and previous is not handle:
             previous.aborted = True
             previous.child.abort()
-            if previous.cleanup_task is not None:
-                previous.cleanup_task.cancel()
-            if previous.started:
-                self._reset_voice_timeout(guild_id)
+            self._restore_streaming_tts_state(previous)
         handles[guild_id] = handle
         return handle
 
@@ -3629,8 +3647,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             handle.audio_format.channels,
             state=handle.resample_carry,
         )
-        if not pcm:
-            return
+        if pcm:
+            await self._write_streaming_mixer_pcm(handle, pcm)
+
+    async def _write_streaming_mixer_pcm(
+        self, handle: _DiscordStreamingTTSHandle, pcm: bytes,
+    ) -> None:
+        """Attach the reserved stream lazily, then append converted mixer PCM."""
         async with handle.start_lock:
             handles = getattr(self, "_streaming_tts_handles", {})
             if handles.get(handle.guild_id) is not handle:
@@ -3660,6 +3683,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     handle.aborted = True
                     handle.child.abort()
                     raise RuntimeError("Discord streaming TTS reservation was superseded")
+                receiver = getattr(self, "_voice_receivers", {}).get(handle.guild_id)
+                if receiver is not None:
+                    receiver.pause()
+                    handle.receiver_paused = True
                 mixer.play_speech_stream(handle.child)
                 if handle.child.finished:
                     raise RuntimeError("Discord voice mixer rejected streaming speech")
@@ -3680,15 +3707,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if interrupted or handle.aborted:
             handle.child.abort()
             handles.pop(handle.guild_id, None)
-            if handle.started:
-                self._reset_voice_timeout(handle.guild_id)
+            self._restore_streaming_tts_state(handle)
             return
+        tail = _voice_mixer_module().resample_to_mixer_pcm(
+            b"",
+            handle.audio_format.sample_rate,
+            handle.audio_format.channels,
+            state=handle.resample_carry,
+            final=True,
+        )
+        if tail:
+            await self._write_streaming_mixer_pcm(handle, tail)
         handle.child.finish()
         if not handle.started:
             handles.pop(handle.guild_id, None)
             return
-        if handle.cleanup_task is None:
-            handle.cleanup_task = asyncio.create_task(self._finish_streaming_tts_cleanup(handle))
+        await self._finish_streaming_tts_cleanup(handle)
 
     async def abort_streaming_tts(self, handle: StreamingTTSHandle, error: Optional[str] = None) -> None:
         """Drop buffered and future audio immediately (idempotent)."""
@@ -3698,17 +3732,28 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         handles = getattr(self, "_streaming_tts_handles", {})
         if handles.get(handle.guild_id) is handle:
             handles.pop(handle.guild_id, None)
-            if handle.started:
-                self._reset_voice_timeout(handle.guild_id)
+            self._restore_streaming_tts_state(handle)
 
     async def _finish_streaming_tts_cleanup(self, handle: _DiscordStreamingTTSHandle) -> None:
-        """Release only this stream after the mixer has drained its buffered tail."""
+        """Release only this stream after bounded mixer-tail drain."""
+        timeout = max(0.1, float(getattr(self, "_streaming_tts_drain_timeout", 5.0)))
+        deadline = asyncio.get_running_loop().time() + timeout
         while not handle.child.finished:
-            await asyncio.sleep(0.02)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                handle.aborted = True
+                handle.child.abort()
+                logger.warning(
+                    "Discord streaming TTS drain timed out after %.1fs in guild %s",
+                    timeout,
+                    handle.guild_id,
+                )
+                break
+            await asyncio.sleep(min(0.02, remaining))
         handles = getattr(self, "_streaming_tts_handles", {})
         if handles.get(handle.guild_id) is handle:
             handles.pop(handle.guild_id, None)
-            self._reset_voice_timeout(handle.guild_id)
+            self._restore_streaming_tts_state(handle)
 
     async def _ensure_voice_mixer(self, guild_id: int):
         """Return the guild's VoiceMixer, installing one when missing.

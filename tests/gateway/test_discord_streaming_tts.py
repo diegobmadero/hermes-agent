@@ -37,7 +37,10 @@ if _DISCORD_DIR not in sys.path:
 
 import voice_mixer as vm  # noqa: E402
 
+import gateway.run as gateway_run  # noqa: E402
+from gateway.config import Platform  # noqa: E402
 from gateway.platforms.base import AudioFormat  # noqa: E402
+from gateway.session import SessionSource  # noqa: E402
 from gateway.streaming_tts_consumer import StreamingTTSConsumer  # noqa: E402
 from tools.tts_streaming import SentenceChunker  # noqa: E402
 
@@ -78,15 +81,19 @@ class TestResampleToMixerPcm:
         # Downmixed amplitude survives (interp may wobble ±1 around 3000).
         assert np.abs(result - 3000).max() <= 2
 
-    def test_odd_byte_is_carried_across_chunks(self):
-        full = b"\x01\x00" * 480
+    def test_arbitrary_chunk_boundaries_match_one_shot_after_flush(self):
+        samples = np.array([0, 1000, 2000, 3000], dtype=np.int16)
+        full = samples.tobytes()
         one_shot = vm.resample_to_mixer_pcm(full, 24000, 1)
         state = bytearray()
-        part1 = vm.resample_to_mixer_pcm(full[:1], 24000, 1, state=state)
-        part2 = vm.resample_to_mixer_pcm(full[1:], 24000, 1, state=state)
-        assert part1 == b""  # nothing sample-aligned yet
-        assert bytes(state) == b""  # carry consumed
-        assert part2 == one_shot  # no sample lost to the split
+        pieces = [
+            vm.resample_to_mixer_pcm(full[index:index + 1], 24000, 1, state=state)
+            for index in range(len(full))
+        ]
+        pieces.append(vm.resample_to_mixer_pcm(b"", 24000, 1, state=state, final=True))
+
+        assert b"".join(pieces) == one_shot
+        assert state == bytearray()
 
     def test_silence_stays_silence(self):
         out = vm.resample_to_mixer_pcm(b"\x00\x00" * 240, 24000, 1)
@@ -193,6 +200,27 @@ class TestStreamingSpeechChild:
         assert writer_done.wait(1.0) is True
         writer.join(timeout=1.0)
         assert child.finished is True
+
+    def test_stop_speech_aborts_child_and_releases_blocked_writer(self):
+        child = vm.StreamingSpeechChild(max_buffer_bytes=vm.FRAME_SIZE)
+        frame = b"\x01\x00" * (vm.FRAME_SIZE // 2)
+        child.append(frame)
+        writer_done = threading.Event()
+        writer = threading.Thread(
+            target=lambda: (child.append(frame), writer_done.set()),
+            daemon=True,
+        )
+        writer.start()
+        assert writer_done.wait(0.05) is False
+
+        mixer = vm.VoiceMixer()
+        mixer.play_speech_stream(child)
+        mixer.stop_speech()
+
+        assert writer_done.wait(1.0) is True
+        writer.join(timeout=1.0)
+        assert child.finished is True
+        assert mixer.speech_active is False
 
 
 # =====================================================================
@@ -396,11 +424,10 @@ class TestBeginStreamingTTS:
         async def run():
             stale = await adapter.begin_streaming_tts("222", AudioFormat())
             await adapter.write_streaming_tts(stale, b"\x10\x00" * 480)
-            await adapter.finish_streaming_tts(stale)
-            assert stale.cleanup_task is not None
-
+            stale_finish = asyncio.create_task(adapter.finish_streaming_tts(stale))
+            await asyncio.sleep(0.05)
             current = await adapter.begin_streaming_tts("222", AudioFormat())
-            await asyncio.sleep(0)
+            await asyncio.wait_for(stale_finish, timeout=1.0)
             assert adapter._streaming_tts_handles[111] is current
             await adapter.write_streaming_tts(current, b"\x20\x00" * 480)
 
@@ -428,8 +455,27 @@ class TestWriteFinishAbort:
             await adapter.write_streaming_tts(handle, chunk)
 
         asyncio.run(run())
-        # ≈ 2x rate × 2 channels = 3840 bytes of mixer PCM.
-        assert abs(len(handle.child._buf) - 3840) <= 4
+        # Incremental interpolation retains one source frame until finish.
+        assert abs(len(handle.child._buf) - 3832) <= 4
+
+    def test_finish_flushes_resampler_endpoint_after_arbitrary_chunks(self):
+        adapter = _make_adapter(voice_fx={"enabled": False, "lead_silence_ms": 0})
+        handle = self._begin(adapter)
+        handle.child.fade_frames = 0
+        source = np.array([0, 1000, 2000, 3000], dtype=np.int16).tobytes()
+        expected = vm.resample_to_mixer_pcm(source, 24000, 1)
+
+        async def run():
+            for byte in source:
+                await adapter.write_streaming_tts(handle, bytes([byte]))
+            finish_task = asyncio.create_task(adapter.finish_streaming_tts(handle))
+            await asyncio.sleep(0.05)
+            drained = _drain_mixer(adapter._voice_mixers[111])
+            await asyncio.wait_for(finish_task, timeout=1.0)
+            return drained
+
+        drained = asyncio.run(run())
+        assert drained[:len(expected)] == expected
 
     def test_write_after_abort_is_dropped(self):
         adapter = _make_adapter()
@@ -450,13 +496,73 @@ class TestWriteFinishAbort:
 
         async def run():
             await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
-            await adapter.finish_streaming_tts(handle)
+            finish_task = asyncio.create_task(adapter.finish_streaming_tts(handle))
+            await asyncio.sleep(0.05)
+            assert handle.child.finished is False
+            pcm = _drain_mixer(adapter._voice_mixers[111])
+            await asyncio.wait_for(finish_task, timeout=1.0)
+            return pcm
 
-        asyncio.run(run())
-        assert handle.child.finished is False  # buffered audio still playing
-        pcm = _drain_mixer(adapter._voice_mixers[111])
+        pcm = asyncio.run(run())
         assert len(pcm) > 0
         assert handle.child.finished is True
+
+    def test_finish_waits_for_mixer_drain_and_releases_ownership(self):
+        adapter = _make_adapter()
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x01\x00" * 480)
+            finish_task = asyncio.create_task(adapter.finish_streaming_tts(handle))
+            await asyncio.sleep(0.05)
+            assert handle.child.finished is False
+            assert finish_task.done() is False
+            _drain_mixer(adapter._voice_mixers[111])
+            await asyncio.wait_for(finish_task, timeout=1.0)
+            assert handle.child.finished is True
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
+        adapter._reset_voice_timeout.assert_called_once_with(111)
+
+    def test_stuck_finish_drain_aborts_and_releases_ownership(self):
+        adapter = _make_adapter()
+        adapter._streaming_tts_drain_timeout = 0.02
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            assert handle is not None
+            await adapter.write_streaming_tts(handle, b"\x01\x00" * 480)
+            await asyncio.wait_for(adapter.finish_streaming_tts(handle), timeout=0.2)
+            assert handle.aborted is True
+            assert handle.child.finished is True
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
+        adapter._reset_voice_timeout.assert_called_once_with(111)
+
+    def test_receiver_pauses_on_first_audio_and_resumes_after_drain(self):
+        adapter = _make_adapter()
+        receiver = MagicMock()
+        adapter._voice_receivers[111] = receiver
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            receiver.pause.assert_not_called()
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            receiver.pause.assert_called_once_with()
+            receiver.resume.assert_not_called()
+
+            finish_task = asyncio.create_task(adapter.finish_streaming_tts(handle))
+            await asyncio.sleep(0.05)
+            _drain_mixer(adapter._voice_mixers[111])
+            await asyncio.wait_for(finish_task, timeout=1.0)
+            receiver.resume.assert_called_once_with()
+
+        asyncio.run(run())
 
     def test_interrupted_finish_discards_tail(self):
         adapter = _make_adapter()
@@ -468,6 +574,56 @@ class TestWriteFinishAbort:
 
         asyncio.run(run())
         assert handle.child.read_frame() is None
+
+    def test_session_interrupt_aborts_audible_stream_after_turn_returns(self):
+        adapter = _make_adapter()
+        adapter._active_sessions = {}
+        adapter._stop_typing_quietly = AsyncMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            await adapter.interrupt_session_activity("discord:voice:222", "222")
+            assert handle.aborted is True
+            assert handle.child.finished is True
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
+
+    def test_gateway_stop_aborts_stream_after_worker_already_exited(self):
+        adapter = _make_adapter()
+        adapter._active_sessions = {}
+        adapter._pending_messages = {}
+        adapter._stop_typing_quietly = AsyncMock()
+        runner = object.__new__(gateway_run.GatewayRunner)
+        setattr(runner, "_peek_session_state", lambda _key: None)
+        setattr(runner, "_invalidate_session_run_generation", lambda _key, reason=None: 2)
+        setattr(runner, "_adapter_for_source", lambda _source: adapter)
+        setattr(runner, "_thread_metadata_for_source", lambda _source: None)
+        setattr(runner, "_release_running_agent_state", lambda _key: None)
+        setattr(runner, "_evict_cached_agent", lambda _key: None)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="222",
+            chat_type="channel",
+            user_id="user-1",
+        )
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            assert handle is not None
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            await runner._interrupt_and_clear_session(
+                "agent:main:discord:channel:222",
+                source,
+                interrupt_reason=gateway_run._INTERRUPT_REASON_STOP,
+                invalidation_reason="stop_command",
+            )
+            assert handle.aborted is True
+            assert getattr(handle, "child").finished is True
+            assert 111 not in adapter._streaming_tts_handles
+
+        asyncio.run(run())
 
 
 # =====================================================================
@@ -545,7 +701,17 @@ class TestConsumerToDiscordSink:
                 finished_at = time.monotonic()
 
             await asyncio.to_thread(feed)
-            completed = await consumer.wait_complete(timeout=5.0)
+            completion = asyncio.create_task(consumer.wait_complete(timeout=5.0))
+            played = bytearray()
+            while not completion.done():
+                mixer = adapter._voice_mixers.get(111)
+                if mixer is not None:
+                    with mixer._lock:
+                        speech_live = bool(mixer._speech)
+                    if speech_live:
+                        played.extend(mixer.read())
+                await asyncio.sleep(0.001)
+            completed = await completion
 
             assert completed is True
             assert first_audio_at is not None
@@ -557,7 +723,7 @@ class TestConsumerToDiscordSink:
             # stereo s16 PCM: 2 clauses × 2 chunks × 480 samples, upsampled
             # 2x and duplicated to stereo = 15360 bytes of non-silence.
             handle = consumer._handle
-            drained = _drain_mixer(adapter._voice_mixers[111])
+            drained = bytes(played) + _drain_mixer(adapter._voice_mixers[111])
             assert len(drained) >= 15360
             assert max(drained) > 0  # real signal, not just silence frames
             assert handle.child.finished is True

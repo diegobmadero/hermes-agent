@@ -260,6 +260,10 @@ class VoiceMixer(discord.AudioSource):
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._speech:
+                abort = getattr(child, "abort", None)
+                if abort is not None:
+                    abort()
             self._speech.clear()
             self._begin_duck_release_locked()
 
@@ -323,6 +327,8 @@ def resample_to_mixer_pcm(
     sample_rate: int,
     channels: int,
     state: Optional[bytearray] = None,
+    *,
+    final: bool = False,
 ) -> bytes:
     """Convert one s16le PCM chunk to the mixer format (48 kHz stereo s16le).
 
@@ -331,17 +337,28 @@ def resample_to_mixer_pcm(
     the rate change and the channel count is normalised (stereo downmixes to
     mono first, then the mono signal is duplicated to both ears).
 
-    ``state`` is an optional caller-owned bytearray carrying the leftover
-    odd byte when a provider chunk splits a 16-bit sample; pass the same
-    object on every call of one stream.  (All current streamers send
-    sample-aligned chunks, but the wire format does not guarantee it.)
+    ``state`` is an optional caller-owned bytearray.  For incremental rate
+    conversion it retains one complete source frame plus any partial frame,
+    preserving interpolation across arbitrary provider chunk boundaries.
+    Call once with ``final=True`` to flush the retained endpoint.
     """
+    trim_endpoint = False
     if state is not None:
         data = bytes(state) + data
         state.clear()
-    if len(data) % 2:
-        if state is not None:
-            state.extend(data[-1:])
+        source_frame_bytes = SAMPLE_WIDTH * channels
+        aligned_len = len(data) - (len(data) % source_frame_bytes)
+        aligned, trailing = data[:aligned_len], data[aligned_len:]
+        if sample_rate != SAMPLE_RATE and not final:
+            if len(aligned) < source_frame_bytes * 2:
+                state.extend(aligned + trailing)
+                return b""
+            state.extend(aligned[-source_frame_bytes:] + trailing)
+            trim_endpoint = True
+        elif not final:
+            state.extend(trailing)
+        data = aligned
+    elif len(data) % SAMPLE_WIDTH:
         data = data[:-1]
     if not data:
         return b""
@@ -356,12 +373,14 @@ def resample_to_mixer_pcm(
         samples = samples.reshape(-1, 2).mean(axis=1)
     samples = samples.astype(np.float32)
 
-    if sample_rate != SAMPLE_RATE and len(samples) >= 2:
-        n_out = max(1, round(len(samples) * SAMPLE_RATE / sample_rate))
+    if sample_rate != SAMPLE_RATE and len(samples) >= 1:
+        ratio = SAMPLE_RATE / sample_rate
+        span = len(samples) - 1 if trim_endpoint else len(samples)
+        n_out = max(1, round(span * ratio))
         x_in = np.arange(len(samples), dtype=np.float64)
         # Position-based mapping: output sample j reads the input at the
         # instant it corresponds to (j * 0.5 for 24k -> 48k).
-        x_out = np.arange(n_out, dtype=np.float64) * (sample_rate / SAMPLE_RATE)
+        x_out = np.arange(n_out, dtype=np.float64) / ratio
         samples = np.interp(x_out, x_in, samples)
 
     stereo = np.repeat(samples[:, None], CHANNELS, axis=1).reshape(-1)
