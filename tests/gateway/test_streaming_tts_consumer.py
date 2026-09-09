@@ -404,14 +404,7 @@ class TestConsumerLifecycle:
 
 
     def test_post_audio_timeout_keeps_suppression_then_aborts(self):
-        """After audible audio, a finalisation timeout aborts the consumer.
-
-        The outer gateway loop calls abort() on timeout so no unowned
-        consumer task lingers.  Suppression is preserved so the gateway
-        does not replay from the beginning.  Updated for #60671
-        hardening: the outer loop now aborts instead of leaving the
-        consumer to complete later in the background.
-        """
+        """A bounded audible supervisor aborts the adapter and cancels its consumer task."""
         async def run(loop):
             adapter = FakeVoiceAdapter()
             streamer = BlockingSecondChunkStreamer()
@@ -432,15 +425,18 @@ class TestConsumerLifecycle:
             assert consumer.suppress_whole_file is True
             assert adapter.written_chunks == [b"chunk-1-0"]
 
-            # The outer loop now aborts on timeout after audible audio
-            # instead of leaving the consumer running in the background.
-            consumer.abort("streaming TTS finalisation timeout")
+            consumer.abort("audible streaming TTS liveness timeout")
             await consumer.wait_complete(timeout=2.0)
+            await asyncio.sleep(0)
 
-            # The consumer is aborted, not completed.
             assert consumer.completed is False
             assert consumer._aborted is True
+            assert consumer._task is not None
+            assert consumer._task.cancelled() is True
+            assert adapter.abort_count == 1
             assert consumer.suppress_whole_file is True
+            streamer.allow_remaining_chunks.set()
+            await asyncio.to_thread(streamer.finished.wait, 1.0)
 
         _run_test(run)
 

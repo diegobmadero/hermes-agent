@@ -168,11 +168,20 @@ class _FinalizationConsumer:
 
     async def wait_complete(self, timeout):
         self.wait_count += 1
-        return self.done
+        if self._task is None:
+            return self.done
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return False
+        self.done = True
+        return True
 
     def abort(self, reason):
         self.abort_reasons.append(reason)
         self.done = True
+        if self._task is not None:
+            self._task.cancel()
 
 
 def test_audible_finalization_is_owned_without_turn_cleanup_abort():
@@ -180,6 +189,7 @@ def test_audible_finalization_is_owned_without_turn_cleanup_abort():
         runner = object.__new__(gateway_run.GatewayRunner)
         runner._background_tasks = set()
         runner._draining = False
+        setattr(runner, "_streaming_tts_audible_timeout", 0.1)
         deferred = asyncio.create_task(asyncio.Event().wait())
         consumer = _FinalizationConsumer(audible=True, task=deferred)
         turn_ctx = SimpleNamespace(
@@ -194,7 +204,9 @@ def test_audible_finalization_is_owned_without_turn_cleanup_abort():
         assert consumer.finish_count == 1
         assert consumer.wait_count == 0
         assert consumer.abort_reasons == []
-        assert deferred in runner._background_tasks
+        supervisor = getattr(consumer, "_hermes_audible_drain_supervisor")
+        assert supervisor in runner._background_tasks
+        assert supervisor is not deferred
 
         tracking = asyncio.create_task(asyncio.Event().wait())
         await runner._run_agent_cleanup_turn_tasks(
@@ -207,10 +219,11 @@ def test_audible_finalization_is_owned_without_turn_cleanup_abort():
             stream_task=None,
         )
         assert consumer.abort_reasons == []
-        assert deferred in runner._background_tasks
+        assert supervisor in runner._background_tasks
 
+        supervisor.cancel()
         deferred.cancel()
-        await asyncio.gather(deferred, return_exceptions=True)
+        await asyncio.gather(supervisor, deferred, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -232,6 +245,48 @@ def test_silent_finalization_retains_bounded_abort_for_fallback():
         assert consumer.wait_count == 2
         assert consumer.abort_reasons == ["streaming TTS finalisation timeout"]
         assert runner._background_tasks == set()
+
+    asyncio.run(run())
+
+
+def test_audible_drain_counts_as_active_restart_work():
+    async def run():
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner._background_tasks = set()
+        runner._running_agents = {}
+        runner._deferred_agent_workers = {}
+        runner.adapters = {}
+        runner._running_cron_job_count = lambda: 0
+        setattr(runner, "_streaming_tts_audible_timeout", 0.1)
+        drain = asyncio.create_task(asyncio.Event().wait())
+        consumer = _FinalizationConsumer(audible=True, task=drain)
+
+        runner._retain_audible_streaming_tts(consumer)
+
+        supervisor = getattr(consumer, "_hermes_audible_drain_supervisor")
+        assert getattr(supervisor, "_hermes_streaming_tts_drain", False) is True
+        assert runner._active_work_count() == 1
+        supervisor.cancel()
+        drain.cancel()
+        await asyncio.gather(supervisor, drain, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_audible_provider_stall_is_bounded_and_aborted():
+    async def run():
+        runner = object.__new__(gateway_run.GatewayRunner)
+        runner._background_tasks = set()
+        setattr(runner, "_streaming_tts_audible_timeout", 0.01)
+        stalled = asyncio.create_task(asyncio.Event().wait())
+        consumer = _FinalizationConsumer(audible=True, task=stalled)
+
+        runner._retain_audible_streaming_tts(consumer)
+        supervisor = getattr(consumer, "_hermes_audible_drain_supervisor")
+        await asyncio.wait_for(supervisor, timeout=0.5)
+
+        assert consumer.abort_reasons == ["audible streaming TTS liveness timeout"]
+        assert stalled.cancelled() is True
 
     asyncio.run(run())
 
