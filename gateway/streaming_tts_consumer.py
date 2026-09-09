@@ -43,6 +43,7 @@ class StreamingTTSConsumer:
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=256)
         self._handle: Optional[StreamingTTSHandle] = None
         self._task: Optional[asyncio.Task] = None  # drain task, created once by start()
+        self._abort_task: Optional[asyncio.Task] = None
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
@@ -199,7 +200,11 @@ class StreamingTTSConsumer:
                 self._handle.audible = self._suppress_whole_file = True
 
     async def _safe_abort(self, reason: str) -> None:
-        """Abort the adapter stream, swallowing errors (idempotent)."""
+        """Cancel provider I/O and abort the adapter stream, swallowing errors."""
+        cancel_provider = getattr(self._streamer, "cancel", None)
+        if callable(cancel_provider):
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.to_thread(cancel_provider), timeout=1.0)
         if self._handle is None:
             return
         try:
@@ -208,6 +213,14 @@ class StreamingTTSConsumer:
         finally:
             if self._handle:
                 self._handle.aborted = True
+
+    def _schedule_abort(self, reason: str) -> None:
+        """Own adapter abort on the gateway loop, then cancel the consumer."""
+        if self._abort_task is None or self._abort_task.done():
+            self._abort_task = self._loop.create_task(self._safe_abort(reason))
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
 
     def abort(self, reason: str = "cancelled") -> None:
         """Idempotent cancellation from any thread."""
@@ -218,17 +231,22 @@ class StreamingTTSConsumer:
         # The load-bearing _ABORT sentinel must reach the queue even when full: evict to make room.
         if not any(self._put_sentinel(_ABORT, mark_dropped=False) for _ in range(3)):
             logger.debug("streaming TTS _ABORT sentinel could not be enqueued")
-        if self._handle is not None and not self._handle.aborted:
-            with contextlib.suppress(Exception):
-                self._loop.call_soon_threadsafe(asyncio.create_task, self._safe_abort(reason))
-        task = self._task
-        if task is not None and not task.done():
-            with contextlib.suppress(Exception):
-                self._loop.call_soon_threadsafe(task.cancel)
+        with contextlib.suppress(Exception):
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is self._loop:
+                self._schedule_abort(reason)
+            else:
+                self._loop.call_soon_threadsafe(self._schedule_abort, reason)
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
         if self._task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        if self._abort_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(self._abort_task), timeout=timeout)
         return self._completed

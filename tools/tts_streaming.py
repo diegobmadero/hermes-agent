@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
@@ -232,6 +233,18 @@ class GeminiStreamer(StreamingTTSProvider):
     def available() -> bool:
         return bool(_gemini_key())
 
+    def __init__(self, tts_config: Dict, section: Dict):
+        super().__init__(tts_config, section)
+        self._response_lock = threading.Lock()
+        self._active_response = None
+
+    def cancel(self) -> None:
+        """Close the active SSE body so a blocked iterator exits promptly."""
+        with self._response_lock:
+            response = self._active_response
+        if response is not None:
+            response.close()
+
     def stream(self, text: str) -> Iterator[bytes]:
         import base64
         import json as _json
@@ -252,25 +265,33 @@ class GeminiStreamer(StreamingTTSProvider):
         url = f"{base_url}/models/{model}:streamGenerateContent"
 
         def _sse_chunks() -> Iterator[bytes]:
-            with requests.post(
-                url, params={"alt": "sse", "key": api_key}, json=payload, timeout=60, stream=True,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data: "):
-                        continue
-                    try:
-                        parts = _json.loads(line[len("data: "):])["candidates"][0]["content"]["parts"]
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        continue
-                    for part in parts:
-                        b64 = (part.get("inlineData") or part.get("inline_data") or {}).get("data", "")
-                        if not b64:
+            response = requests.post(
+                url, params={"alt": "sse", "key": api_key}, json=payload, timeout=(10, 15), stream=True,
+            )
+            with self._response_lock:
+                self._active_response = response
+            try:
+                with response:
+                    response.raise_for_status()
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line or not line.startswith("data: "):
                             continue
                         try:
-                            yield base64.b64decode(b64)
-                        except (ValueError, TypeError) as exc:
-                            logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+                            parts = _json.loads(line[len("data: "):])["candidates"][0]["content"]["parts"]
+                        except (ValueError, KeyError, IndexError, TypeError):
+                            continue
+                        for part in parts:
+                            b64 = (part.get("inlineData") or part.get("inline_data") or {}).get("data", "")
+                            if not b64:
+                                continue
+                            try:
+                                yield base64.b64decode(b64)
+                            except (ValueError, TypeError) as exc:
+                                logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+            finally:
+                with self._response_lock:
+                    if self._active_response is response:
+                        self._active_response = None
 
         yield from _capped(_sse_chunks(), "Gemini streaming TTS")
 

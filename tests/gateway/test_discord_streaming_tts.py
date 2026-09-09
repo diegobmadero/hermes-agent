@@ -663,6 +663,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._dropped = False
     consumer._suppress_whole_file = False
     consumer._task = None
+    consumer._abort_task = None
     consumer._lock = threading.Lock()
     consumer._strip_markdown = None
     return consumer

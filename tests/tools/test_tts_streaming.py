@@ -209,6 +209,52 @@ def test_xai_available_uses_oauth_credential_resolver(monkeypatch):
 # ── Gemini SSE parsing ────────────────────────────────────────────────────
 
 
+def test_gemini_cancel_closes_active_sse_response(monkeypatch):
+    import sys
+    import types
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+        def close(self):
+            self.closed = True
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, decode_unicode=True):
+            assert decode_unicode is True
+            yield 'data: {"candidates":[{"content":{"parts":[{"inlineData":{"data":"AQI="}}]}}]}'
+
+    response = Response()
+    posted = {}
+
+    def post(*_args, **kwargs):
+        posted.update(kwargs)
+        return response
+
+    monkeypatch.setattr(ts, "_gemini_key", lambda: "test-key")
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(post=post))
+    streamer = ts.GeminiStreamer({}, {"model": "test-model", "voice": "test-voice"})
+    chunks = streamer.stream("hello")
+
+    assert next(chunks) == b"\x01\x02"
+    assert getattr(streamer, "_active_response") is response
+    assert posted["timeout"] == (10, 15)
+
+    getattr(streamer, "cancel")()
+    assert response.closed is True
+    getattr(chunks, "close")()
+    assert getattr(streamer, "_active_response") is None
+
+
 # ── xAI WebSocket bridge ─────────────────────────────────────────────────
 
 
