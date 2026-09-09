@@ -34,6 +34,7 @@ SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_LENGTH_MS // 1000   # 960
 FRAME_SIZE = SAMPLES_PER_FRAME * CHANNELS * SAMPLE_WIDTH    # 3840 bytes
 BYTES_PER_MS = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH // 1000  # 192
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
+STREAMING_BUFFER_BYTES = BYTES_PER_MS * 2000
 
 
 class MixerChild:
@@ -96,7 +97,7 @@ class StreamingSpeechChild:
 
     __slots__ = (
         "name", "gain", "is_speech", "fade_frames", "_fade_done",
-        "_buf", "_eof", "_aborted", "_lock",
+        "_buf", "_eof", "_aborted", "_lock", "_max_buffer_bytes",
     )
 
     def __init__(
@@ -105,6 +106,7 @@ class StreamingSpeechChild:
         *,
         gain: float = 1.0,
         fade_in_ms: int = 40,
+        max_buffer_bytes: int = STREAMING_BUFFER_BYTES,
     ):
         self.name = name
         self.gain = float(gain)
@@ -114,27 +116,42 @@ class StreamingSpeechChild:
         self._buf = bytearray()
         self._eof = False
         self._aborted = False
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
+        self._max_buffer_bytes = max(FRAME_SIZE, int(max_buffer_bytes))
 
-    def append(self, pcm: bytes) -> None:
-        """Append mixer-format PCM (48 kHz stereo s16le). No-op after abort."""
+    def append(self, pcm: bytes) -> bool:
+        """Append mixer PCM, waiting for bounded capacity. False after finish/abort."""
         if not pcm:
-            return
+            return True
         with self._lock:
-            if self._aborted or self._eof:
-                return
-            self._buf.extend(pcm)
+            offset = 0
+            while offset < len(pcm):
+                while (
+                    len(self._buf) >= self._max_buffer_bytes
+                    and not self._aborted
+                    and not self._eof
+                ):
+                    self._lock.wait()
+                if self._aborted or self._eof:
+                    return False
+                available = self._max_buffer_bytes - len(self._buf)
+                end = min(len(pcm), offset + available)
+                self._buf.extend(pcm[offset:end])
+                offset = end
+            return True
 
     def finish(self) -> None:
         """Signal end-of-stream: the buffered tail plays out, then done."""
         with self._lock:
             self._eof = True
+            self._lock.notify_all()
 
     def abort(self) -> None:
         """Drop buffered and future audio immediately (idempotent)."""
         with self._lock:
             self._aborted = True
             self._buf.clear()
+            self._lock.notify_all()
 
     @property
     def finished(self) -> bool:
@@ -155,9 +172,11 @@ class StreamingSpeechChild:
             if len(self._buf) >= FRAME_SIZE:
                 raw = bytes(self._buf[:FRAME_SIZE])
                 del self._buf[:FRAME_SIZE]
+                self._lock.notify_all()
             elif self._eof and self._buf:
                 raw = bytes(self._buf) + b"\x00" * (FRAME_SIZE - len(self._buf))
                 self._buf.clear()
+                self._lock.notify_all()
             elif self._eof:
                 return None
             else:
@@ -288,6 +307,10 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             self._closed = True
             self._ambient = None
+            for child in self._speech:
+                abort = getattr(child, "abort", None)
+                if abort is not None:
+                    abort()
             self._speech.clear()
 
 
