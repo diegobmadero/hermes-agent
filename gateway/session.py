@@ -333,7 +333,11 @@ def _discord_platform_notes(context: SessionContext) -> List[str]:
     # Static pointer: live voice-channel state goes on the user message (prompt-cache safety).
     lines += ["", (
         "Voice-channel state, when relevant, appears in the current message as a "
-        "`[Voice channel now: ...]` note."
+        "`[Voice channel now: ...]` note. When the current or most recent such note shows that "
+        "the user is connected, assume assistant output may be listened to. During tool-heavy or "
+        "research work, give a brief spoken status before a wait likely to exceed a few seconds, "
+        "then another concise update when the phase changes or the wait becomes long. Do not narrate "
+        "every tool call, expose private reasoning, or repeat raw tool details."
     )]
     return lines
 
