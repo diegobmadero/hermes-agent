@@ -155,6 +155,9 @@ class TestBuildSessionContextPrompt:
         assert "1001" not in p1 and "2002" not in p2 and "3003" not in p3
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
+        assert "brief spoken status" in p1
+        assert "Do not narrate every tool call" in p1
+        assert "private reasoning" in p1
 
     def test_slack_prompt_no_tools_shows_disclaimer(self):
         """Without slack toolset loaded, prompt must show the stale-API disclaimer."""
