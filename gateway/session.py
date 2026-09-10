@@ -335,9 +335,15 @@ def _discord_platform_notes(context: SessionContext) -> List[str]:
         "Voice-channel state, when relevant, appears in the current message as a "
         "`[Voice channel now: ...]` note. When the current or most recent such note shows that "
         "the user is connected, assume assistant output may be listened to. During tool-heavy or "
-        "research work, give a brief spoken status before a wait likely to exceed a few seconds. "
-        "Keep each progress status under ten words, and send another only when the phase meaningfully "
-        "changes or the wait becomes long. This limit applies to progress updates, not the final "
+        "research work, you may give a brief spoken status before a wait likely to exceed a few seconds. "
+        "PROGRESS-UPDATE BREVITY (strict - it has been ignored before): brevity is judged by "
+        "INFORMATION, not word count. Each spoken status carries at most ONE unit of information - "
+        "what is happening now, or that the phase changed. No padding: no preambles ('I will now'), "
+        "no method explanations, no listing of steps, no restating the request, no sign-offs. Length "
+        "scales with what actually changed: if one clause suffices, say one clause; if the state "
+        "genuinely needs 15 words, say those 15 - but if it could be said in 5, say 5. If a status "
+        "would convey nothing new, stay silent; silence beats padding. Send another only when the "
+        "phase meaningfully changes or the wait becomes long. This limit applies to progress updates, not the final "
         "answer. Do not narrate every tool call, expose private reasoning, or repeat raw tool details."
     )]
     return lines
