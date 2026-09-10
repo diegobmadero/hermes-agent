@@ -166,12 +166,14 @@ class _FinalizationConsumer:
     def finish(self):
         self.finish_count += 1
 
-    async def wait_complete(self, timeout):
+    async def wait_complete(self, timeout, idle_timeout=None):
         self.wait_count += 1
         if self._task is None:
             return self.done
+        # Model the real consumer: an idle timeout caps how long a still-running task is waited on.
+        wait_s = timeout if idle_timeout is None else min(timeout, idle_timeout)
         try:
-            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=wait_s)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return False
         self.done = True
@@ -283,9 +285,10 @@ def test_audible_provider_stall_is_bounded_and_aborted():
 
         runner._retain_audible_streaming_tts(consumer)
         supervisor = getattr(consumer, "_hermes_audible_drain_supervisor")
-        await asyncio.wait_for(supervisor, timeout=0.5)
+        # Idle clamp is a 1s floor; the supervisor must abort well before any lifetime backstop.
+        await asyncio.wait_for(supervisor, timeout=3.0)
 
-        assert consumer.abort_reasons == ["audible streaming TTS liveness timeout"]
+        assert consumer.abort_reasons == ["audible streaming TTS idle timeout (no new audio for 1s)"]
         assert stalled.cancelled() is True
 
     asyncio.run(run())

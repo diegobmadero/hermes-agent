@@ -459,6 +459,9 @@ class StreamingTTSHandle:
     # falling back to whole-file TTS (don't replay already-audible output).
     audible: bool = False
     aborted: bool = False  # set by abort_streaming_tts; late chunks are dropped
+    # Monotonic time of the last PCM write (None before first): idle-detection input so a
+    # healthy long stream is never mistaken for a stalled provider.
+    _last_audio_at: float | None = None
 
 
 def streaming_tts_turn_key(session_key: str | None, turn_marker: Any = None, *, event: Any = None) -> str | None:

@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -46,6 +47,11 @@ class StreamingTTSConsumer:
         self._abort_task: Optional[asyncio.Task] = None
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
+        # Idle-detection state: True only while the drain loop is inside provider I/O for a
+        # clause; _provider_block_started is when that block began. A stalled provider (no PCM
+        # for idle_timeout) is cut; an LLM tool-call gap (not awaiting provider) is not.
+        self._awaiting_provider = False
+        self._provider_block_started: Optional[float] = None
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
 
     active = property(lambda self: self._streamer is not None)  # usable streaming provider
@@ -186,18 +192,25 @@ class StreamingTTSConsumer:
                 self._strip_markdown = lambda t: t  # noqa: E731
         if not (cleaned := self._strip_markdown(clause).strip()):
             return
-        iterator = iter(self._streamer.stream(cleaned))
-        while True:
-            # next() runs in a thread so a blocking provider never stalls the loop.
-            chunk = await asyncio.to_thread(next, iterator, _DONE)
-            if chunk is _DONE or self._aborted or self._handle.aborted:
-                return
-            if not chunk:
-                continue
-            was_audible = self._handle.audible
-            await self._adapter.write_streaming_tts(self._handle, chunk)
-            if not was_audible:
-                self._handle.audible = self._suppress_whole_file = True
+        self._awaiting_provider = True
+        self._provider_block_started = time.monotonic()
+        try:
+            iterator = iter(self._streamer.stream(cleaned))
+            while True:
+                # next() runs in a thread so a blocking provider never stalls the loop.
+                chunk = await asyncio.to_thread(next, iterator, _DONE)
+                if chunk is _DONE or self._aborted or self._handle.aborted:
+                    return
+                if not chunk:
+                    continue
+                was_audible = self._handle.audible
+                await self._adapter.write_streaming_tts(self._handle, chunk)
+                if not was_audible:
+                    self._handle.audible = self._suppress_whole_file = True
+                self._handle._last_audio_at = time.monotonic()
+        finally:
+            self._awaiting_provider = False
+            self._provider_block_started = None
 
     async def _safe_abort(self, reason: str) -> None:
         """Cancel provider I/O and abort the adapter stream, swallowing errors."""
@@ -241,12 +254,31 @@ class StreamingTTSConsumer:
             else:
                 self._loop.call_soon_threadsafe(self._schedule_abort, reason)
 
-    async def wait_complete(self, timeout: float = 10.0) -> bool:
-        """Wait for the drain task to finish. Returns True only on full success."""
-        if self._task is not None:
+    async def wait_complete(self, timeout: float = 10.0, idle_timeout: Optional[float] = None) -> bool:
+        """Wait for the drain task to finish. Returns True only on full success.
+
+        ``timeout`` bounds total lifetime; ``idle_timeout`` additionally returns when the TTS
+        provider has been mid-synthesis with no PCM for that long (a stalled provider). LLM
+        gaps between clauses (tool calls) don't count — only provider I/O does — so a long,
+        healthy response is never cut."""
+        if self._task is None:
+            return self._completed
+        deadline = time.monotonic() + max(0.1, timeout)
+        idle_timeout = idle_timeout if (idle_timeout is not None and idle_timeout > 0) else None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=min(remaining, 0.25))
+            if self._task.done():
+                break
+            if (idle_timeout is not None
+                    and self._awaiting_provider
+                    and self._provider_block_started is not None
+                    and (time.monotonic() - self._provider_block_started) >= idle_timeout):
+                break
         if self._abort_task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(asyncio.shield(self._abort_task), timeout=timeout)
+                await asyncio.wait_for(asyncio.shield(self._abort_task), timeout=2.0)
         return self._completed

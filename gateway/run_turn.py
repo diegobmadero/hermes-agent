@@ -3288,12 +3288,25 @@ class GatewayTurnMixin:
         )
 
     async def _supervise_audible_streaming_tts(self, stts: Any) -> None:
-        """Bound the complete audible synthesis-plus-playback lifetime."""
-        timeout = max(0.1, float(getattr(self, "_streaming_tts_audible_timeout", 60.0)))
+        """Bound the audible stream by IDLE time, not total lifetime.
+
+        A healthy stream keeps writing PCM as it plays, so a long response is never cut:
+        abort only when no new audio arrives within ``audible_idle_timeout`` (stalled
+        provider / dead connection), with ``audible_max_lifetime`` as a runaway backstop.
+        Both are overridable via ``tts.audible_idle_timeout`` / ``tts.audible_max_lifetime``."""
         try:
-            if await stts.wait_complete(timeout=timeout):
+            from tools.tts_tool import _load_tts_config
+            tts_cfg = _load_tts_config()
+        except Exception:
+            tts_cfg = {}
+        idle = float(tts_cfg.get("audible_idle_timeout", getattr(self, "_streaming_tts_audible_timeout", 60.0)))
+        lifetime = float(tts_cfg.get("audible_max_lifetime", getattr(self, "_streaming_tts_audible_lifespan", 3600.0)))
+        idle = max(1.0, idle)
+        lifetime = max(idle + 1.0, lifetime)
+        try:
+            if await stts.wait_complete(timeout=lifetime, idle_timeout=idle):
                 return
-            stts.abort("audible streaming TTS liveness timeout")
+            stts.abort("audible streaming TTS idle timeout (no new audio for %.0fs)" % idle)
             await stts.wait_complete(timeout=2.0)
         except asyncio.CancelledError:
             if not getattr(stts, "done", False):
