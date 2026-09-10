@@ -765,3 +765,165 @@ class TestConsumerToDiscordSink:
             loop.run_until_complete(asyncio.wait_for(run(loop), timeout=10.0))
         finally:
             loop.close()
+
+
+# =====================================================================
+# Barge-in: user speech interrupts an active streaming-TTS stream
+# =====================================================================
+
+BOT_SSRC = 0xB07
+USER_SSRC = 0x4E55
+
+
+class _FakeVoiceConn:
+    """Just enough of ``voice_client._connection`` to start a real receiver."""
+    def __init__(self, ssrc=BOT_SSRC):
+        self.secret_key = b"\x00" * 32
+        self.dave_session = object()
+        self.ssrc = ssrc
+        self.hook = None
+        self.ws = object()  # non-MISSING so the live-ws hook install path is exercised
+        self._listeners = []
+
+    def add_socket_listener(self, fn):
+        self._listeners.append(fn)
+
+    def remove_socket_listener(self, fn):
+        self._listeners.remove(fn)
+
+
+def _make_receiver(callback, *, guild_id=111, bot_ssrc=BOT_SSRC, paused=True):
+    """Real VoiceReceiver over a fake connection, hook already installed."""
+    from plugins.platforms.discord.adapter import VoiceReceiver
+    conn = _FakeVoiceConn(ssrc=bot_ssrc)
+    vc = MagicMock()
+    vc._connection = conn
+    rx = VoiceReceiver(vc, allowed_user_ids=set(),
+                       guild_id=guild_id, barge_in_callback=callback)
+    rx.start()
+    if paused:
+        rx.pause()
+    return rx, conn
+
+
+def _speaking_msg(ssrc, user_id, speaking=1):
+    return {"op": 5, "d": {"ssrc": ssrc, "user_id": user_id, "speaking": speaking}}
+
+
+class TestReceiverBargeInDetection:
+    def test_sustained_speech_fires_callback_once(self, monkeypatch):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        monkeypatch.setattr(VoiceReceiver, "_BARGE_IN_GRACE_SECONDS", 0.05)
+        calls = []
+        rx, conn = _make_receiver(lambda g, u: calls.append((g, u)))
+
+        async def run():
+            await conn.hook(None, _speaking_msg(USER_SSRC, 4242))
+            await asyncio.sleep(0.15)
+
+        asyncio.run(run())
+        assert calls == [(111, 4242)]
+
+    def test_cough_that_stops_before_grace_does_not_fire(self, monkeypatch):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        monkeypatch.setattr(VoiceReceiver, "_BARGE_IN_GRACE_SECONDS", 0.2)
+        calls = []
+        rx, conn = _make_receiver(lambda g, u: calls.append((g, u)))
+
+        async def run():
+            await conn.hook(None, _speaking_msg(USER_SSRC, 4242, speaking=1))
+            await asyncio.sleep(0.05)
+            await conn.hook(None, _speaking_msg(USER_SSRC, 4242, speaking=0))
+            await asyncio.sleep(0.3)
+
+        asyncio.run(run())
+        assert calls == []
+
+    def test_bot_own_speaking_never_fires(self, monkeypatch):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        monkeypatch.setattr(VoiceReceiver, "_BARGE_IN_GRACE_SECONDS", 0.05)
+        calls = []
+        rx, conn = _make_receiver(lambda g, u: calls.append((g, u)))
+
+        async def run():
+            await conn.hook(None, _speaking_msg(BOT_SSRC, 9999))
+            await asyncio.sleep(0.15)
+
+        asyncio.run(run())
+        assert calls == []
+
+    def test_speech_before_pause_is_ignored(self, monkeypatch):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        monkeypatch.setattr(VoiceReceiver, "_BARGE_IN_GRACE_SECONDS", 0.05)
+        calls = []
+        rx, conn = _make_receiver(lambda g, u: calls.append((g, u)), paused=False)
+
+        async def run():
+            # Not paused → we're not playing → no barge-in.
+            await conn.hook(None, _speaking_msg(USER_SSRC, 4242))
+            await asyncio.sleep(0.15)
+            assert calls == []
+            # Now mid-stream → sustained speech fires.
+            rx.pause()
+            await conn.hook(None, _speaking_msg(USER_SSRC, 4242))
+            await asyncio.sleep(0.15)
+            return calls
+
+        assert asyncio.run(run()) == [(111, 4242)]
+
+    def test_callback_receives_guild_and_user(self, monkeypatch):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        monkeypatch.setattr(VoiceReceiver, "_BARGE_IN_GRACE_SECONDS", 0.05)
+        calls = []
+        rx, conn = _make_receiver(lambda g, u: calls.append((g, u)), guild_id=777)
+
+        async def run():
+            await conn.hook(None, _speaking_msg(USER_SSRC, 31337))
+            await asyncio.sleep(0.15)
+
+        asyncio.run(run())
+        assert calls == [(777, 31337)]
+
+
+class TestAdapterBargeIn:
+    def test_barge_in_aborts_stream_and_resumes_receiver(self):
+        adapter = _make_adapter()
+        receiver = MagicMock()
+        adapter._voice_receivers[111] = receiver
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            assert handle.receiver_paused is True
+            await adapter._on_voice_barge_in(111, 4242)
+            return handle
+
+        handle = asyncio.run(run())
+        assert handle.aborted is True
+        assert 111 not in adapter._streaming_tts_handles
+        # Receiver resumed: the user's utterance is now captured, transcribed,
+        # and dispatched as a normal message (which interrupts the agent).
+        receiver.resume.assert_called_once_with()
+
+    def test_barge_in_is_scoped_to_the_guild(self):
+        adapter = _make_adapter()
+        receiver = MagicMock()
+        adapter._voice_receivers[111] = receiver
+        adapter._reset_voice_timeout = MagicMock()
+
+        async def run():
+            handle = await adapter.begin_streaming_tts("222", AudioFormat())
+            await adapter.write_streaming_tts(handle, b"\x10\x00" * 480)
+            # Someone else's guild: no effect.
+            await adapter._on_voice_barge_in(999, 4242)
+            assert handle.aborted is False
+            assert adapter._streaming_tts_handles[111] is handle
+            # Same guild: stream stops.
+            await adapter._on_voice_barge_in(111, 4242)
+            return handle
+
+        handle = asyncio.run(run())
+        assert handle.aborted is True
+        assert 111 not in adapter._streaming_tts_handles
+        receiver.resume.assert_called_once_with()

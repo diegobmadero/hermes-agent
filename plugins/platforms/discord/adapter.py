@@ -644,9 +644,20 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None,
+                 *, guild_id: int = 0,
+                 barge_in_callback: Optional[Callable[[int, int], Any]] = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self._guild_id = guild_id
+        # Optional async (or sync) callback invoked when a non-bot user starts speaking
+        # while the bot is streaming TTS. The receiver is paused during playback (echo
+        # protection) so the user's voice is never captured by the UDP path; the SPEAKING
+        # event is the only signal that they began talking, and it lets the bot barge in.
+        self._barge_in_callback = barge_in_callback
+        # Pending barge-in timers keyed by SSRC: a short grace so a cough/chirp (brief VAD
+        # blip) doesn't cut off a long reply, but sustained speech does.
+        self._barge_in_timers: Dict[int, Any] = {}
         self._running = False
         self._secret_key: Optional[bytes] = None
         self._dave_session = None
@@ -703,7 +714,16 @@ class VoiceReceiver:
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5); ``conn.hook`` is
-        re-passed on each (re)connect, so wrap it on the state AND the live websocket."""
+        re-passed on each (re)connect, so wrap it on the state AND the live websocket.
+
+        A non-bot SPEAKING event is also the barge-in signal: while the bot is playing
+        streaming TTS the receiver is paused (echo protection), so the user's voice is never
+        captured by the UDP path and the normal utterance pipeline can't interrupt. The
+        SPEAKING event arrives independently over the voice websocket, so it's the only cue
+        that the user began talking mid-stream. Discord sends op 5 with ``speaking`` set on
+        speech start and cleared on speech stop, so a short grace period lets a cough/chirp
+        that ends before it cancels out; sustained speech past the grace fires the callback,
+        which stops the stream (resuming the receiver so the utterance is still captured)."""
         original_hook = conn.hook
         receiver_self = self
 
@@ -713,8 +733,14 @@ class VoiceReceiver:
                 ssrc = data.get("ssrc")
                 user_id = data.get("user_id")
                 if ssrc and user_id:
-                    logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
-                    receiver_self.map_ssrc(int(ssrc), int(user_id))
+                    ssrc_i, user_id_i = int(ssrc), int(user_id)
+                    logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc_i, user_id_i)
+                    receiver_self.map_ssrc(ssrc_i, user_id_i)
+                    # Barge-in: a non-bot user toggled their speaking flag while we play.
+                    # Only act while the receiver is paused (i.e. we're mid-stream).
+                    if receiver_self._paused and ssrc_i != receiver_self._bot_ssrc:
+                        await receiver_self._track_barge_in(
+                            ssrc_i, data.get("speaking", 1), user_id_i)
             if original_hook:
                 await original_hook(ws, msg)
         conn.hook = wrapped_hook
@@ -725,6 +751,49 @@ class VoiceReceiver:
                 logger.info("Speaking hook installed on live websocket")
         except Exception as e:
             logger.warning("Could not install hook on live ws: %s", e)
+
+    # Grace before barge-in fires: long enough to ignore a cough/chirp, short enough to
+    # feel like an immediate interruption to the user.
+    _BARGE_IN_GRACE_SECONDS = 0.6
+
+    async def _track_barge_in(self, ssrc: int, speaking: int, user_id: int):
+        """Debounce a barge-in: start the grace timer on speech start (``speaking`` set),
+        cancel it if the same SSRC stops speaking before it fires. Only one timer per SSRC."""
+        if not speaking:
+            timer = self._barge_in_timers.pop(ssrc, None)
+            if timer is not None and not timer.done():
+                timer.cancel()
+                logger.debug("Barge-in cancelled (ssrc %d stopped speaking)", ssrc)
+            return
+        if ssrc in self._barge_in_timers:
+            return  # already counting down for this speaker; speech is continuing
+        if self._barge_in_callback is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        timer = loop.create_task(self._barge_in_delayed(ssrc, user_id))
+        self._barge_in_timers[ssrc] = timer
+
+    async def _barge_in_delayed(self, ssrc: int, user_id: int):
+        """Wait the grace, then fire the barge-in callback if the user is still speaking."""
+        try:
+            await asyncio.sleep(self._BARGE_IN_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        self._barge_in_timers.pop(ssrc, None)
+        if not self._paused or ssrc == self._bot_ssrc:
+            return  # stream already ended; nothing to barge in on
+        if self._barge_in_callback is None:
+            return
+        try:
+            logger.info("Barge-in: user %d sustained speech during TTS", user_id)
+            result = self._barge_in_callback(self._guild_id, user_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning("Barge-in callback failed (user %d)", user_id, exc_info=True)
 
     # --- Packet handler (called from SocketReader thread) ---
 
@@ -3425,7 +3494,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if source is not None:
                 self._voice_sources[guild_id] = source
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    guild_id=guild_id,
+                    barge_in_callback=self._on_voice_barge_in,
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3598,6 +3672,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         for handle in list(handles.values()):
             if str(handle.chat_id) == str(chat_id):
                 await self.abort_streaming_tts(handle, error="session interrupted")
+
+    async def _on_voice_barge_in(self, guild_id: int, user_id: int) -> None:
+        """Stop any streaming TTS playing in *guild_id* because a user started speaking.
+
+        Wired as the ``VoiceReceiver`` barge-in callback. Aborting the handle stops the audio
+        immediately and (via ``_restore_streaming_tts_state``) resumes the receiver, so the
+        user's in-progress utterance is still captured, transcribed, and dispatched as a normal
+        message — which then interrupts the running agent turn through the existing busy-session
+        path. This is the half that was missing: the receiver is paused while we play (echo
+        protection), so without this the user's voice was never captured and nothing could
+        interrupt the stream; you were stuck until the TTS finished.
+        """
+        handles = getattr(self, "_streaming_tts_handles", {})
+        for handle in list(handles.values()):
+            if handle.guild_id != guild_id:
+                continue
+            logger.info("Barge-in: stopping streaming TTS in guild %s (user %s)",
+                        guild_id, user_id)
+            await self.abort_streaming_tts(handle, error="barge-in")
 
     async def begin_streaming_tts(
         self,
