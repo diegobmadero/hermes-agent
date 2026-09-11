@@ -44,6 +44,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH
 CAP = DiscordAdapter.MAX_SPLIT_MESSAGES
+VOICE_CAP = DiscordAdapter.VOICE_MAX_SPLIT_MESSAGES
 
 
 def _make_adapter():
@@ -94,6 +95,69 @@ class TestSendCap:
 
         assert result.success is True
         assert len(sends) == CAP
+        assert "Response truncated" in sends[-1]
+
+    @pytest.mark.asyncio
+    async def test_voice_linked_send_allows_normal_briefing_above_text_cap(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = []
+
+        async def fake_send(*, content, reference=None):
+            sends.append(content)
+            return SimpleNamespace(id=9000 + len(sends))
+
+        channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
+        adapter._client = SimpleNamespace(
+            get_channel=lambda _cid: channel,
+            fetch_channel=AsyncMock(),
+        )
+        voice_client = MagicMock()
+        voice_client.is_connected.return_value = True
+        adapter._voice_clients[111] = voice_client
+        adapter._voice_text_channels[111] = 555
+        content = "v" * 15_898
+        expected_chunks = adapter.truncate_message(
+            adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH
+        )
+        assert CAP < len(expected_chunks) <= VOICE_CAP
+
+        result = await adapter.send("555", content)
+
+        assert result.success is True
+        assert VOICE_CAP > CAP
+        assert sends == expected_chunks
+        assert all("Response truncated" not in chunk for chunk in sends)
+
+    @pytest.mark.asyncio
+    async def test_voice_linked_send_still_caps_degenerate_flood(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        sends = []
+
+        async def fake_send(*, content, reference=None):
+            sends.append(content)
+            return SimpleNamespace(id=9000 + len(sends))
+
+        channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
+        adapter._client = SimpleNamespace(
+            get_channel=lambda _cid: channel,
+            fetch_channel=AsyncMock(),
+        )
+        voice_client = MagicMock()
+        voice_client.is_connected.return_value = True
+        adapter._voice_clients[111] = voice_client
+        adapter._voice_text_channels[111] = 555
+        adapter.truncate_message = MagicMock(
+            return_value=[f"degenerate-{i}" for i in range(VOICE_CAP + 10)]
+        )
+
+        result = await adapter.send("555", "degenerate voice response")
+
+        assert result.success is True
+        assert len(sends) == VOICE_CAP
         assert "Response truncated" in sends[-1]
 
 

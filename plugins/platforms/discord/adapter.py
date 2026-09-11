@@ -1091,6 +1091,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     # characters — without a cap the adapter posts every 2000-char chunk back-to-back and floods the channel
     # (the incident delivered 60,698 chars as 31 messages).
     MAX_SPLIT_MESSAGES = 8
+    # Voice-linked turns are often spoken briefings. Keep those intact through a larger, still
+    # bounded ceiling so a normal 15-30k response is not mistaken for a degenerate flood.
+    VOICE_MAX_SPLIT_MESSAGES = 16
 
     # Voice auto-disconnect after N idle seconds (discord.voice_channel_inactivity_timeout_seconds; 0 off).
     VOICE_TIMEOUT = 300
@@ -1124,6 +1127,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
+        # Active gateway turns per voice-linked guild. The inactivity clock is suspended while
+        # model/tool/delivery work is in flight and starts fresh only after the last turn finishes.
+        self._voice_processing_counts: Dict[int, int] = {}
         self._voice_timeout_seconds = self._load_voice_timeout()
         self._playback_timeout_seconds = self._load_playback_timeout()
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
@@ -2844,6 +2850,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
+        self._suspend_voice_timeout_for_processing(event)
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
@@ -2852,6 +2859,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
+        self._resume_voice_timeout_after_processing(event)
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
         if not self._reactions_enabled():
             return
@@ -2882,7 +2890,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             logger.debug("Could not build reply-to reference: %s", e)
             return None
 
-    def _cap_split_chunks(self, chunks: List[str]) -> List[str]:
+    def _split_delivery_limit(self, chat_id: str) -> int:
+        """Use the larger bounded ceiling for a channel currently linked to Discord voice."""
+        if self._voice_guild_for_chat(str(chat_id)) is not None:
+            return self.VOICE_MAX_SPLIT_MESSAGES
+        return self.MAX_SPLIT_MESSAGES
+
+    def _cap_split_chunks(
+        self, chunks: List[str], *, max_messages: Optional[int] = None,
+    ) -> List[str]:
         """Cap chunks at ``MAX_SPLIT_MESSAGES``: keep the first N-1 and replace the rest with a
         notice so a degenerate turn can't flood the channel (full text stays in session history).
 
@@ -2891,13 +2907,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         chars as 31 back-to-back Discord messages. The full response remains available in the gateway
         session history / logs. See #86581.
         """
-        if len(chunks) <= self.MAX_SPLIT_MESSAGES:
+        limit = self.MAX_SPLIT_MESSAGES if max_messages is None else max(2, int(max_messages))
+        if len(chunks) <= limit:
             return chunks
-        kept = chunks[: self.MAX_SPLIT_MESSAGES - 1]
-        dropped_chars = sum(len(c) for c in chunks[self.MAX_SPLIT_MESSAGES - 1 :])
+        kept = chunks[: limit - 1]
+        dropped_chars = sum(len(c) for c in chunks[limit - 1 :])
         notice = (
             f"\n\n⚠️ **Response truncated** — this reply exceeded the "
-            f"delivery limit ({self.MAX_SPLIT_MESSAGES} messages). "
+            f"delivery limit ({limit} messages). "
             f"{dropped_chars} characters were not delivered; the full "
             f"response is in the session logs."
         )
@@ -2945,7 +2962,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return await self._record_response_async(reply_to, result, content, final_delivery)
             formatted = self.format_message(content)
             chunks = self._cap_split_chunks(
-                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH),
+                max_messages=self._split_delivery_limit(str(getattr(channel, "id", chat_id))),
             )
             message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)
@@ -3171,7 +3189,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         A continuation failure still reports success plus ``partial_overflow`` so the consumer
         delivers the tail; only a first-chunk edit failure returns ``success=False``."""
         formatted = self.format_message(content)
-        chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
+        chunks = self._cap_split_chunks(
+            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH),
+            max_messages=self._split_delivery_limit(str(getattr(channel, "id", ""))),
+        )
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
             await msg.edit(content=chunks[0] if chunks else formatted)
@@ -3549,6 +3570,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             task = self._voice_timeout_tasks.pop(guild_id, None)
             if task:
                 task.cancel()
+            getattr(self, "_voice_processing_counts", {}).pop(guild_id, None)
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
@@ -3639,10 +3661,48 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _voice_guild_for_chat(self, chat_id: str) -> Optional[int]:
         """Return the guild whose bound text channel is *chat_id*, when the
         bot is currently connected to a voice channel there."""
-        for gid, text_ch_id in getattr(self, "_voice_text_channels", {}).items():
-            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
-                return gid
+        guild_id = self._bound_voice_guild_for_chat(chat_id)
+        if guild_id is not None and self.is_in_voice_channel(guild_id):
+            return guild_id
         return None
+
+    def _bound_voice_guild_for_chat(self, chat_id: str) -> Optional[int]:
+        """Return the guild bound to *chat_id* without requiring a live voice client."""
+        for guild_id, text_channel_id in getattr(self, "_voice_text_channels", {}).items():
+            if str(text_channel_id) == str(chat_id):
+                return guild_id
+        return None
+
+    _VOICE_PROCESSING_GUILD_METADATA_KEY = "_discord_voice_processing_guild_id"
+
+    def _suspend_voice_timeout_for_processing(self, event: MessageEvent) -> None:
+        """Suspend inactivity timing for the complete model/tool/delivery turn."""
+        guild_id = self._voice_guild_for_chat(str(event.source.chat_id))
+        if guild_id is None:
+            return
+        counts = getattr(self, "_voice_processing_counts", None)
+        if counts is None:
+            counts = self._voice_processing_counts = {}
+        counts[guild_id] = counts.get(guild_id, 0) + 1
+        event.metadata[self._VOICE_PROCESSING_GUILD_METADATA_KEY] = guild_id
+        self._cancel_voice_timeout(guild_id)
+
+    def _resume_voice_timeout_after_processing(self, event: MessageEvent) -> None:
+        """Start a fresh idle window after the last linked turn has delivered."""
+        guild_id = event.metadata.pop(self._VOICE_PROCESSING_GUILD_METADATA_KEY, None)
+        if not isinstance(guild_id, int):
+            return
+        counts = getattr(self, "_voice_processing_counts", {})
+        active = counts.get(guild_id, 0)
+        if active <= 0:
+            return
+        remaining = active - 1
+        if remaining > 0:
+            counts[guild_id] = remaining
+            return
+        counts.pop(guild_id, None)
+        if self.is_in_voice_channel(guild_id):
+            self._reset_voice_timeout(guild_id)
 
     def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
         """Accept the provider contract Hermes currently emits: 24 kHz mono s16le PCM."""
@@ -3898,6 +3958,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _reset_voice_timeout(self, guild_id: int) -> None:
         """Reset the auto-disconnect inactivity timer."""
         self._cancel_voice_timeout(guild_id)
+        if getattr(self, "_voice_processing_counts", {}).get(guild_id, 0) > 0:
+            logger.debug(
+                "Voice inactivity timeout suspended during active processing (guild=%d)", guild_id,
+            )
+            return
         timeout = self._voice_timeout_limit()
         if timeout <= 0:
             logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
@@ -3914,6 +3979,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             await asyncio.sleep(timeout)
         except asyncio.CancelledError:
+            return
+        # A timeout task can race with processing-start cancellation after its sleep completes.
+        # The processing-complete hook owns re-arming a fresh idle window.
+        if getattr(self, "_voice_processing_counts", {}).get(guild_id, 0) > 0:
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
         # ``/voice off`` keeps the bot in the channel; only the bot's own audio counts as

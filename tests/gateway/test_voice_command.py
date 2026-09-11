@@ -836,6 +836,47 @@ class TestDiscordVoiceChannelMethods:
         existing_task.cancel.assert_called_once()
         assert adapter._voice_timeout_tasks == {}
 
+    def test_voice_timeout_stays_suspended_while_linked_turn_is_processing(self):
+        adapter = self._make_adapter()
+        adapter._voice_timeout_seconds = 300
+        adapter._voice_processing_counts = {111: 1}
+        existing_task = MagicMock()
+        adapter._voice_timeout_tasks[111] = existing_task
+
+        adapter._reset_voice_timeout(111)
+
+        existing_task.cancel.assert_called_once()
+        assert adapter._voice_timeout_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_processing_hooks_suspend_then_restart_voice_timeout(self, monkeypatch):
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._voice_processing_counts = {}
+        adapter._voice_text_channels[111] = 123
+        voice_client = MagicMock()
+        voice_client.is_connected.return_value = True
+        adapter._voice_clients[111] = voice_client
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+        monkeypatch.setenv("DISCORD_REACTIONS", "false")
+
+        event = _make_event(chat_id="123")
+        event.raw_message = SimpleNamespace()
+        with patch("asyncio.to_thread", new=AsyncMock()):
+            await adapter.on_processing_start(event)
+            assert adapter._voice_processing_counts == {111: 1}
+            adapter._cancel_voice_timeout.assert_called_once_with(111)
+
+            # A new /voice join can rebind the guild while the old turn is still running.
+            # Completion must release the guild captured at start, not resolve the new binding.
+            adapter._voice_text_channels[111] = 456
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert adapter._voice_processing_counts == {}
+        adapter._reset_voice_timeout.assert_called_once_with(111)
+
     def test_discord_voice_timeout_config_loaded(self):
         from plugins.platforms.discord.adapter import DiscordAdapter
         from gateway.config import PlatformConfig
