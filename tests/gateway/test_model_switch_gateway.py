@@ -9,6 +9,7 @@ therefore store the SAME override shape the /model handler writes, so both
 the eviction guard and next-message runtime resolution see the switch.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import gateway.run as gateway_run
@@ -30,6 +31,8 @@ def _make_runner():
     tests/gateway/test_reasoning_command.py)."""
     runner = object.__new__(gateway_run.GatewayRunner)
     runner._session_model_overrides = {}
+    # Upstream reads session-state; this helper still stores the dex dict. Bridge them.
+    runner._session_model_override = lambda session_key: runner._session_model_overrides.get(session_key)
     return runner
 
 
@@ -59,13 +62,15 @@ class TestModelUpdateCallback:
         source = _make_event().source
         session_key = runner._session_key_for_source(source)
 
+        # Upstream now takes (session_key, agent, config_model); keep the eviction-survival invariant.
+        agent = SimpleNamespace(model=_OVERRIDE["model"])
         callback = runner._make_model_update_callback(session_key)
         assert (
-            runner._is_intentional_model_switch(session_key, _OVERRIDE["model"]) is False
+            runner._is_intentional_model_switch(session_key, agent, "config-default-model") is False
         )
         callback("old-model", dict(_OVERRIDE), "session")
 
-        assert runner._is_intentional_model_switch(session_key, _OVERRIDE["model"]) is True
+        assert runner._is_intentional_model_switch(session_key, agent, "config-default-model") is True
 
     def test_next_message_resolution_applies_override(self):
         """_apply_session_model_override must hand back the switched runtime
