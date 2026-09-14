@@ -191,10 +191,15 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = (
 # contains "limit exceeded", which would otherwise read as billing). oMLX
 # reworded the accounting sentence in 0.5.7 ("predicted peak would require /
 # exceed"); the 0.5.6 wording is still in the field, so both stay. (#52261)
+# llama.cpp also emits a token-less HTTP 500 "Context size has been exceeded"
+# when a unified-KV / multi-slot pool is full of sibling requests. That
+# substring would otherwise match overflow's "context size" and auto-reset a
+# short child chat. Keep the full sentence here, ahead of overflow. (#52261 class)
 _MEMORY_CEILING_PATTERNS = (
     "memory guard", "memory limit exceeded", "memory_guard_tier", "dynamic ceiling",
     "memory ceiling", "available memory", "out of memory", "insufficient memory",
     "prefill would require", "predicted peak would", "prefill safety cap", "metal_cap",
+    "context size has been exceeded",
 )
 
 # Structured codes identifying the same rejection at the source, before an

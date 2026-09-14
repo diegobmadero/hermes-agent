@@ -728,6 +728,18 @@ class TestClassifyApiError:
         assert result.should_compress is False
         assert result.should_rotate_credential is False
 
+    def test_llamacpp_shared_kv_pool_500_is_overloaded_not_overflow(self):
+        """llama.cpp reports a full unified-KV / slot pool as HTTP 500
+        ``Context size has been exceeded.`` with no token counts. That is
+        sibling-request occupancy, not this transcript overflowing the
+        window — compression cannot free it and would auto-reset the session.
+        """
+        e = MockAPIError("Context size has been exceeded.", status_code=500)
+        result = classify_api_error(e, provider="custom", model="huihui")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
+        assert result.retryable is True
+
     def test_genuine_context_overflow_still_compresses(self):
         """Guard against over-reach: a real window overflow must keep its
         compression recovery."""
