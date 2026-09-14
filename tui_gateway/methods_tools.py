@@ -6,6 +6,7 @@ Helper names must not collide with server.py's own (``_cmd_`` / ``_toolset_`` / 
 """
 
 import sys
+from pathlib import Path
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -40,7 +41,10 @@ def _profile_scoped_rpc(
             token = None
             if profile := _str_arg(params, "profile") if scoped else "":
                 try:
-                    profile_dir = _tools_mod("hermes_cli.profiles").get_profile_dir(profile)
+                    try:
+                        profile_dir = _tools_mod("hermes_cli.profiles").get_profile_dir(profile)
+                    except ValueError:  # traversal-shaped name: same answer as a missing dir
+                        profile_dir = None
                     if not profile_dir or not profile_dir.is_dir():
                         return _err(rid, 4064, f"profile '{profile}' not found")
                     token = _tools_mod("hermes_constants").set_hermes_home_override(str(profile_dir))
@@ -282,17 +286,22 @@ def _(rid, params: dict) -> dict:
     req_rev = str(params.get("rev") or "")
 
     def _refresh_session_agent() -> None:
-        """Rebuild THIS session's cached tool snapshot + push session.info (the agent never
-        re-reads the registry). Runs under _mcp_reload_lock so a concurrent reload can't
-        tear the registry down mid-refresh."""
-        if not session:
-            return
-        agent = session["agent"]
-        try:  # enabled_override re-resolves toolsets so a server enabled in config this session is picked up
-            _mcp_agent.refresh_agent_mcp_tools(agent, enabled_override=_load_enabled_toolsets(), quiet_mode=True)
-        except Exception as _exc:
-            logger.warning("Failed to refresh cached agent tools after /reload-mcp: %s", _exc)
-        _emit("session.info", params.get("session_id", ""), _session_info(agent, session))
+        """Rebuild EVERY live session's cached tool snapshot + push session.info (agents never
+        re-read the registry). The MCP pool is process-global, so refreshing only the requester
+        would leave sibling sessions on stale tools until /new — and a request without a
+        resolvable session_id (desktop passes ``activeSessionId ?? undefined``) would refresh
+        nothing while still answering "reloaded". Runs under _mcp_reload_lock so a concurrent
+        reload can't tear the registry down mid-refresh."""
+        with _sessions_lock:
+            live = [(sid, sess) for sid, sess in _sessions.items() if sess.get("agent") is not None]
+        for sid, sess in live:
+            agent = sess["agent"]
+            try:  # enabled_override re-resolves toolsets so a server enabled in config this session is picked up
+                with _session_profile_runtime_scope(sess):
+                    _mcp_agent.refresh_agent_mcp_tools(agent, enabled_override=_load_enabled_toolsets(), quiet_mode=True)
+            except Exception as _exc:
+                logger.warning("Failed to refresh cached agent tools after /reload-mcp (session %s): %s", sid, _exc)
+            _emit("session.info", sid, _session_info(agent, sess))
 
     def _do_full_reload() -> None:
         """shutdown+discover+refresh under the lock, then mark a completed generation. Config
@@ -308,6 +317,17 @@ def _(rid, params: dict) -> dict:
             if after == loaded:
                 break
             loaded = after
+        # The unscoped shutdown tore down every profile's servers, but discover_mcp_tools() above
+        # only rebuilt the launch profile's overlay; a secondary-profile session refreshed against
+        # that registry would lose its MCP tools until its own reload.
+        with _sessions_lock:
+            homes = {sess.get("profile_home") for sess in _sessions.values() if sess.get("agent") is not None}
+        for home in sorted(homes - {None}):
+            try:
+                with _session_profile_runtime_scope({"profile_home": home}):
+                    _mcp_discovery.discover_mcp_tools()
+            except Exception as _exc:
+                logger.warning("MCP rediscovery failed for profile %s: %s", home, _exc)
         _refresh_session_agent()
         _mcp_reload_loaded_rev = loaded
         _mcp_reload_gen += 1
@@ -869,13 +889,16 @@ def _(rid, params: dict) -> dict:
 
 
 # ─── Insights / rollback / browser / config ──────────────────────────────────
-@_rpc("insights.get", 5017)
+@_scoped_rpc("insights.get", 5017)
 def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
-    if (db := _get_db()) is None:
-        return _db_unavailable_error(rid, code=5017)
-    cutoff = time.time() - days * 86400
-    rows = [s for s in db.list_sessions_rich(limit=500, compact_rows=True) if (s.get("started_at") or 0) >= cutoff]
+    # ``profile`` selects that profile's store; the launch handle is never the fallback for a
+    # scoped call (a foreign first touch used to pin the process-wide handle, #102526).
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5017)
+        cutoff = time.time() - days * 86400
+        rows = [s for s in db.list_sessions_rich(limit=500, compact_rows=True) if (s.get("started_at") or 0) >= cutoff]
     return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.get("message_count", 0) for s in rows)})
 
 
@@ -1331,6 +1354,7 @@ def _plugin_rows() -> list[dict]:
     cat = _tools_mod("hermes_cli.plugins_cmd_catalog")
     enabled, disabled = pc._get_enabled_set(), pc._get_disabled_set()
     pins = cat.catalog_pins()  # powers the desktop's "Update to <pin>" affordance
+    ref_pins = pc._read_install_metadata()  # ``--ref`` installs: pinned_sha so the desktop can show the pin
     out = []
     for name, version, desc, source, _dir, key in sorted(pc._discover_all_plugins()):
         status = pc._plugin_status(name, enabled, disabled, key=key)
@@ -1339,10 +1363,16 @@ def _plugin_rows() -> list[dict]:
         if status == "not enabled" and source == "bundled" and pc._bundled_default_on(_dir):
             status = "enabled"
         # key = canonical registry key (names collide across category dirs); portable = Agent Plugins v1.
+        # ``has_desktop_half``: the package also ships a Desktop UI half (``desktop/plugin.js``). The
+        # desktop app pairs its app-level copy of that half with this row so one package is ONE row.
+        _dir_path = Path(str(_dir)) if _dir else None
         out.append({
             "name": name, "key": key, "version": str(version or ""), "description": desc or "",
             "source": source, "status": status, "portable": pc._is_portable_plugin_dir(_dir),
-            **cat.catalog_row_fields(_dir, pins)})
+            "install_dir": str(_dir_path) if _dir_path else "",
+            "has_desktop_half": bool(_dir_path and (_dir_path / "desktop" / "plugin.js").is_file()),
+            **cat.catalog_row_fields(_dir, pins),
+            **({"pinned_sha": sha} if (sha := pc.pinned_revision(name, ref_pins)) else {})})
     return out
 
 
@@ -1373,7 +1403,8 @@ def _plugins_install(rid, params):
     if not ident and not catalog_name:
         return _err(rid, 4019, "plugins.install requires 'identifier', 'repo', or 'catalog_name'")
     result = _tools_mod("hermes_cli.plugins_cmd").dashboard_install_plugin(
-        ident, force=bool(params.get("force")), enable=params.get("enable", True), catalog_name=catalog_name or None)
+        ident, force=bool(params.get("force")), enable=params.get("enable", True), catalog_name=catalog_name or None,
+        ref=str(params.get("ref") or "").strip() or None)
     return _ok(rid, result) if result.get("ok") else _err(rid, 5026, result.get("error") or "install failed")
 
 
