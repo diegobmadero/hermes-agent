@@ -93,4 +93,16 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--force-venv", action="store_true", default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    update_parser.add_argument(
+        "--no-gateway-restart", action="store_true", default=False,
+        help="Update code and dependencies but skip the final gateway restart. "
+            "Use for cron/automated updates that run inside the gateway process: "
+            "the gateway would otherwise restart its own cgroup and kill the updater. "
+            "Pair with a separate restart step (e.g. a cron that runs 10-15 min later).",
+    )
+    update_parser.add_argument(
+        "--post-swap", default=None, metavar="FILE", help=argparse.SUPPRESS,
+        # Internal: the pre-pull interpreter re-executes itself here after the code swap so the
+        # rest of the update runs on the pulled code (hermes_cli/update_handoff.py).
+    )
     update_parser.set_defaults(func=cmd_update)

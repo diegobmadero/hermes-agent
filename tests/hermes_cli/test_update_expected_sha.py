@@ -34,6 +34,53 @@ EXPECTED = "a" * 40
 OTHER = "b" * 40
 BRANCH = "release/tested"
 
+
+@pytest.mark.real_post_swap_handoff
+def test_post_swap_forwards_normalized_pin(monkeypatch):
+    from hermes_cli import update_handoff
+
+    seen = {}
+    monkeypatch.setattr(
+        update_handoff, "continue_update_in_fresh_interpreter",
+        lambda payload, *, argv_tail: seen.update(argv=argv_tail) or 0)
+    opts = SimpleNamespace(
+        pre_update_version=None, active_lazy_features=None, active_tool_dependencies=None)
+    with pytest.raises(SystemExit) as exc:
+        hermes_update_cmd._hand_off_post_swap(
+            _update_args(BRANCH, EXPECTED.upper()), swap="git", branch=BRANCH,
+            opts=opts, gateway_mode=False, had_desktop_app_before_update=False)
+    assert exc.value.code == 0
+    assert seen["argv"] == ["--yes", "--branch", BRANCH, "--expected-sha", EXPECTED]
+
+
+@pytest.mark.parametrize("matches", [False, True])
+def test_post_swap_checks_pin_before_install(git_isolation, tmp_path, monkeypatch, matches):
+    graph = _build_pinned_graph(tmp_path)
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", graph.work)
+    monkeypatch.setattr(hermes_update_cmd, "_base_git_cmd", lambda: ["git"])
+    monkeypatch.setattr(hermes_update_cmd, "_ensure_non_trampoline_git", lambda cmd: cmd)
+    monkeypatch.setattr(
+        hermes_update_cmd, "_resolve_update_options",
+        lambda *a: hermes_update_cmd._UpdateOptions(
+            active_lazy_features=None, active_tool_dependencies=None, pre_update_version=None,
+            gw_input_fn=None, assume_yes=True, keep_stash=False, switch_branch=False,
+            discard_local_changes=False))
+    seen = []
+    monkeypatch.setattr(
+        hermes_update_cmd, "_finish_pulled_update", lambda *a, **kw: seen.append(kw))
+    pin = graph.base if matches else graph.second
+    args = _update_args(BRANCH, pin.upper())
+    payload = {"swap": "git", "branch": BRANCH}
+    if matches:
+        hermes_update_cmd._execute_post_swap(payload, args, gateway_mode=False)
+        assert seen[0]["expected_sha"] == pin
+    else:
+        with pytest.raises(SystemExit) as exc:
+            hermes_update_cmd._execute_post_swap(payload, args, gateway_mode=False)
+        assert exc.value.code == 1
+        assert seen == []
+    assert _git_sha(graph.work) == graph.base
+
 # Real subprocess.run, captured before any monkeypatch swaps the attribute.
 _REAL_RUN = subprocess.run
 
@@ -499,7 +546,7 @@ def update_seams(monkeypatch):
     monkeypatch.setattr(hermes_update_cmd, "_restart_gateway_fleet_after_update", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_update_cmd, "_verify_fleet_after_update", lambda *a, **kw: None)
-    monkeypatch.setattr(hermes_update_cmd, "_apply_pending_fleet_restart_catchup", lambda: None)
+    monkeypatch.setattr(hermes_update_cmd, "_apply_pending_fleet_restart_catchup", lambda **kw: None)
 
     def _record_upstream_sync(*args, **kwargs):
         calls.upstream_syncs.append((args, kwargs))
