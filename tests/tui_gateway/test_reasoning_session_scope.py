@@ -201,7 +201,7 @@ class TestPersistTrueEndToEnd:
         # Invalidate the module-level config cache (keyed on path, but keep
         # this test independent of prior cache state).
         monkeypatch.setattr(server, "_cfg_cache", None)
-        monkeypatch.setattr(server, "_cfg_mtime", None)
+        monkeypatch.setattr(server, "_cfg_sig", None)
         monkeypatch.setattr(server, "_cfg_path", None)
 
         tool_defs = [
