@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
+from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
@@ -172,5 +173,60 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
+
+
+@pytest.mark.asyncio
+async def test_fast_gate_follows_session_model_override(monkeypatch, tmp_path):
+    """A conversation switched to a fast-capable model can enable /fast even when the profile
+    default model is not fast-capable: the gate reads the session's /model choice, not
+    ``model.default``."""
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "deepseek-flash")
+
+    event = _make_event("/fast fast")
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides[session_key] = {"model": "gpt-6-astra", "provider": "openai-codex"}
+
+    response = await runner._handle_fast_command(event)
+
+    assert "FAST" in response
+    assert runner._service_tier == "priority"
+
+
+@pytest.mark.asyncio
+async def test_fast_gate_refuses_session_model_without_fast_support(monkeypatch, tmp_path):
+    """The gate must not fall back to a fast-capable profile default when the session itself
+    runs a model without fast-mode support."""
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.6-sol")
+
+    event = _make_event("/fast fast")
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides[session_key] = {"model": "deepseek-flash", "provider": "deepseek"}
+
+    response = await runner._handle_fast_command(event)
+
+    assert response == t("gateway.fast.not_supported")
+    assert runner._service_tier is None
+
+
+@pytest.mark.asyncio
+async def test_fast_gate_refuses_unsupported_profile_default(monkeypatch, tmp_path):
+    """With no session override the configured default model still governs availability."""
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "deepseek-flash")
+
+    response = await runner._handle_fast_command(_make_event("/fast fast"))
+
+    assert response == t("gateway.fast.not_supported")
 
 

@@ -788,7 +788,18 @@ class GatewayModelCommandsMixin:
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(session_key=session_key)
-        if not model_supports_fast_mode(_resolve_gateway_model(_load_gateway_config())):
+        # The gate follows the model this conversation will actually run: a session /model
+        # override wins over the profile default, so a conversation switched to a fast-capable
+        # model can opt in even when the configured default model is not fast-capable (and a
+        # session on a plain model stays ineligible when the default is fast-capable).
+        if session_key:
+            try:
+                self._rehydrate_session_model_override(session_key)
+            except Exception:
+                logger.debug("Failed to rehydrate session model override for /fast gate", exc_info=True)
+        _fast_override = (getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}
+        _gate_model = str(_fast_override.get("model") or "").strip() or _resolve_gateway_model(_load_gateway_config())
+        if not model_supports_fast_mode(_gate_model):
             return t("gateway.fast.not_supported")
         if args and args != "status":
             return self._apply_fast_selection(session_key, args, persist=persist_global)
