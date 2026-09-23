@@ -598,7 +598,7 @@ class TestWriteFinishAbort:
         runner = object.__new__(gateway_run.GatewayRunner)
         setattr(runner, "_peek_session_state", lambda _key: None)
         setattr(runner, "_invalidate_session_run_generation", lambda _key, reason=None: 2)
-        setattr(runner, "_adapter_for_source", lambda _source: adapter)
+        setattr(runner, "_delivery_adapter_for", lambda _source: adapter)
         setattr(runner, "_thread_metadata_for_source", lambda _source: None)
         setattr(runner, "_release_running_agent_state", lambda _key, run_generation=None: None)
         setattr(runner, "_evict_cached_agent", lambda _key: None)
