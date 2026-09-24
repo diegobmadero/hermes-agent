@@ -115,6 +115,41 @@ class TestGenerateGeminiTts:
         # Audio payload should match the PCM we put in
         assert data[44:] == fake_pcm_bytes
 
+    def test_gemini_38_wav_response_is_not_rewrapped(self, tmp_path, monkeypatch):
+        """Gemini 3.8+ unary responses are already complete WAV files — they must pass through."""
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        wav_payload = b"RIFF" + b"\x24\x00\x00\x00" + b"WAVE" + b"fmt " + b"\x00" * 16 \
+            + b"data" + b"\x08\x00\x00\x00" + b"pcmbytes"
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "audio/wav",
+                                    "data": base64.b64encode(wav_payload).decode(),
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        output_path = str(tmp_path / "out38.wav")
+        with patch("requests.post", return_value=resp):
+            result = _generate_gemini_tts(
+                "Hi", output_path, {"gemini": {"model": "gemini-3.8-flash-lite-tts"}}
+            )
+
+        assert result == output_path
+        assert (tmp_path / "out38.wav").read_bytes() == wav_payload
+
     def test_x_goog_api_client_header_is_set(self, tmp_path, monkeypatch, mock_gemini_response):
         """Gemini TTS requests should include Hermes client context."""
         from hermes_cli import __version__

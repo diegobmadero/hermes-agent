@@ -557,8 +557,9 @@ def _gemini_error_detail(response: Any) -> str:
 
 
 def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
-    """Generate audio via Gemini ``generateContent`` (``responseModalities=["AUDIO"]``). The reply is
-    base64 24kHz mono 16-bit PCM, wrapped as WAV and ffmpeg-converted to the requested container."""
+    """Generate audio via Gemini ``generateContent`` (``responseModalities=["AUDIO"]``). Replies are
+    24kHz mono 16-bit PCM (pre-3.8, wrapped as WAV) or a complete WAV (3.8+); both are
+    ffmpeg-converted to the requested container."""
     origin = _origin()
     api_key = origin._resolve_provider_key("GEMINI_API_KEY", "gemini") or origin._resolve_provider_key(
         "GOOGLE_API_KEY", "gemini")
@@ -609,9 +610,15 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
         if audio_part is None:
             raise RuntimeError("Gemini TTS response contained no audio data")
-        audio_b64 = (audio_part.get("inlineData") or audio_part.get("inline_data") or {}).get("data", "")
+        audio_inline = audio_part.get("inlineData") or audio_part.get("inline_data") or {}
+        audio_b64 = audio_inline.get("data", "")
     except (KeyError, IndexError, TypeError) as e:
         raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
     if not audio_b64:
         raise RuntimeError("Gemini TTS returned empty audio data")
-    return _write_wav_bytes_as(_wrap_pcm_as_wav(base64.b64decode(audio_b64)), output_path)
+    audio_bytes = base64.b64decode(audio_b64)
+    if audio_bytes[:4] == b"RIFF":
+        # Gemini 3.8+ returns a complete WAV for unary requests; wrapping it again would treat
+        # container bytes as PCM (click at the start, trailing chunk noise), so pass it through.
+        return _write_wav_bytes_as(audio_bytes, output_path)
+    return _write_wav_bytes_as(_wrap_pcm_as_wav(audio_bytes), output_path)
