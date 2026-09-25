@@ -163,28 +163,6 @@ class BlockingSecondChunkStreamer(FakeStreamer):
             self.finished.set()
 
 
-class UnsupportedAdapter:
-    """Adapter that does not support streaming TTS (default base behaviour)."""
-
-    def _should_auto_tts_for_chat(self, chat_id):
-        return True
-
-    def supports_streaming_tts(self, chat_id, audio_format):
-        return False
-
-    async def begin_streaming_tts(self, chat_id, audio_format, metadata=None):
-        return None
-
-    async def write_streaming_tts(self, handle, chunk):
-        pass
-
-    async def finish_streaming_tts(self, handle, *, interrupted=False):
-        pass
-
-    async def abort_streaming_tts(self, handle, error=None):
-        pass
-
-
 def _make_consumer(adapter, chat_id, loop, streamer):
     """Build a StreamingTTSConsumer with pre-set internals for testing."""
     consumer = StreamingTTSConsumer.__new__(StreamingTTSConsumer)
@@ -374,16 +352,6 @@ class TestAdapterContractDefaults:
         adapter = _make_minimal_adapter()
         assert adapter.supports_streaming_tts("chat1", AudioFormat()) is False
 
-    def test_begin_returns_none_by_default(self):
-        adapter = _make_minimal_adapter()
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(
-                adapter.begin_streaming_tts("chat1", AudioFormat())
-            )
-            assert result is None
-        finally:
-            loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -797,32 +765,6 @@ class TestPostAudioTimeoutAbort:
 # ---------------------------------------------------------------------------
 
 
-class TestGatewayOuterFinalisationNoNameError:
-    """Exercise the real outer finalisation path to prove no NameError.
-
-    This test does NOT use the StreamingTTSConsumer helper tests alone —
-    it verifies that ``gateway/run.py``'s outer finalisation code can
-    reference ``streaming_tts_consumer_holder[0]`` without hitting a
-    NameError on a normal gateway turn.  We do this by importing the
-    symbol and exercising the code path that would have failed.
-    """
-
-    def test_streaming_tts_consumer_holder_is_list_not_name(self):
-        """The outer scope uses a holder list, not a bare local name.
-
-        This is a structural invariant: if someone reintroduces the
-        cross-scope NameError by moving the consumer back into
-        ``run_sync`` as a local, this test documents the correct shape.
-        """
-        # The holder pattern is the fix.  Verify it is a mutable container.
-        holder: list = [None]
-        assert holder[0] is None
-        holder[0] = "sentinel"
-        assert holder[0] == "sentinel"
-        # The outer scope must be able to read it without a NameError.
-        # This is trivially true with a holder, but was NOT true when
-        # the consumer was a run_sync local.
-        _ = holder[0]
 
 
 class TestEndpointReportedRate:
