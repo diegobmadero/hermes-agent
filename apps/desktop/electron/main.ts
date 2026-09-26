@@ -256,6 +256,7 @@ import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway
 import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
 import { resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
+import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
 import { desktopBackendSpawnEnv, guestOnboardingEnabled, skipIntroEnabled } from './guest-onboarding'
 import { readAndConsumeHandoffResult } from './handoff-result'
@@ -308,6 +309,7 @@ import { CHROMIUM_LOG_FILENAME, enableLinuxCrashDiagnostics, linuxCrashDiagnosti
 import { notifyLauncherWindowRevealed } from './linux-launcher-ready'
 import { decideNvidiaEglFallback, parseNvidiaDriverMajor } from './linux-nvidia-egl-fallback'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
+import { resolveIpcFileReadPath, resolveMediaRequestPath, resolvePreviewTargetPath } from './local-read-path'
 import { localSkinProfileKey, readLocalSkinPayload } from './local-skin'
 import { ACTIVE_LOG_POLL_MS, planLogRotation, reclaimActiveLogIfOversized } from './log-rotation'
 import { registerMachineProfile } from './machine-profile'
@@ -391,10 +393,7 @@ import { createPortalSession } from './portal-session'
 import { createKeepAwake } from './power-save'
 import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
 import { capturePreviewContents } from './preview-capture'
-import {
-  onPreviewWatchOwnerDestroyed,
-  sendPreviewFileChangedToOwner
-} from './preview-file-watch'
+import { onPreviewWatchOwnerDestroyed, sendPreviewFileChangedToOwner } from './preview-file-watch'
 import { PreviewReachRegistry } from './preview-reach'
 import {
   createPrimaryRemoteConnection,
@@ -423,9 +422,12 @@ import {
   fetchRemoteProfileSessions,
   findRemoteOwnerProfileForSession,
   mergeProfileSessionWindow,
+  pathWithRemoteOwnerScope,
   type RegistrySessionSource,
+  remoteProfileQueryScope,
   spliceRegistrySessionRows,
-  tagRegistrySessionResponse
+  tagRegistrySessionResponse,
+  tagRemoteSessionRows
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { createQuitFinalization } from './quit-finalization'
@@ -483,6 +485,7 @@ import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection }
 import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
 import { createSshTeardownTracker } from './ssh-teardown'
 import { createStreamThrottle } from './stream-throttle'
+import { installSystemCaTrust } from './system-ca'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, titleBarOverlayOptions } from './titlebar-overlay-width'
 import {
@@ -593,7 +596,6 @@ import {
   shouldSurfaceErrorForRendererStackCookieCrashLoop,
   writeGpuStackCookieMarker
 } from './windows-stack-cookie-fallback'
-import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -666,6 +668,7 @@ let windowsGpuStackCookieRelaunchAttempted = false
 
 if (IS_WINDOWS) {
   const windowsGpuUserData = app.getPath('userData')
+
   const gpuStackCookieDecision = decideWindowsGpuStackCookieLaunch({
     argv: process.argv,
     marker: readGpuStackCookieMarker(windowsGpuUserData),
@@ -1512,7 +1515,12 @@ function registerMediaProtocol(): void {
       })
     },
     resolveLocalFile: async filePath => {
-      const { resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' })
+      // On a Windows host with a WSL backend the media path arrives as a
+      // WSL/POSIX path (`/home/...`, `/mnt/c/...`) the Windows fs can't open
+      // as-is; bridge it to a UNC/drive form first, same as directory reads.
+      const { resolvedPath } = await resolveReadableFileForIpc(resolveMediaRequestPath(filePath), {
+        purpose: 'Media stream'
+      })
 
       return resolvedPath
     },
@@ -2079,6 +2087,7 @@ async function openExternalFile(rawUrl: string) {
 
   if (lastReveal !== undefined && now - lastReveal < FILE_REVEAL_DEDUPE_MS) {
     rememberLog(`[file] duplicate reveal request within ${FILE_REVEAL_DEDUPE_MS}ms; ignored: ${localPath}`)
+
     return
   }
 
@@ -2987,8 +2996,9 @@ function makeDashboardReadyFile() {
 // resolveGitBinary — locate git.exe on Windows. A fresh installer-driven
 // install only has PortableGit under %LOCALAPPDATA%\hermes\git (never on
 // PATH), so a bare spawn('git') ENOENTs and self-update checks fail with
-// "Couldn't check for updates". PortableGit first, then standard
-// Git-for-Windows locations, then PATH. Cached after first probe.
+// "Couldn't check for updates". PortableGit first, then UGit's bundled copy
+// (see ./git-binary-candidates), then standard Git-for-Windows locations,
+// then PATH. Cached after first probe.
 let _gitBinaryCache = null
 
 // A binary can exist on disk and still be unlaunchable — on macOS an
@@ -3049,19 +3059,19 @@ function resolveGitBinary() {
   }
 
   const localAppData = process.env.LOCALAPPDATA || ''
-  const candidates = []
 
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'git.exe'))
-  }
-
-  candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'cmd', 'git.exe'))
-  candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'cmd', 'git.exe'))
-
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'Programs', 'Git', 'cmd', 'git.exe'))
-  }
+  // Fixed candidates + the UGit-bundled glob (a UGit install moves with every
+  // app-* version, so it can only be found by enumerating the dir). UGit's
+  // git.exe is usually on PATH, but an Explorer-launched Electron inherits the
+  // login-time environment block and can miss it (#61494).
+  const candidates = windowsGitCandidates(
+    {
+      localAppData,
+      programFiles: process.env['ProgramFiles'] || 'C:\\Program Files',
+      programFilesX86: process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+    },
+    { existsSync: fileExists, readdirSync: dir => fs.readdirSync(dir) }
+  )
 
   _gitBinaryCache = candidates.find(fileExists) || findOnPath('git') || 'git'
 
@@ -5947,7 +5957,10 @@ async function previewFileTarget(rawTarget, baseDir) {
   const raw = String(rawTarget || '').trim()
   const base = baseDir ? path.resolve(expandUserPath(baseDir)) : resolveHermesCwd()
 
-  let resolved = resolveRequestedPathForIpc(/^file:/i.test(raw) ? raw : expandUserPath(raw), {
+  // A plain backend target is a WSL/POSIX path; bridge it to a Windows-
+  // accessible form before resolving so the existence checks below (and the
+  // final read) hit the real file rather than a drive-relative C:\home\... miss.
+  let resolved = resolveRequestedPathForIpc(resolvePreviewTargetPath(raw, expandUserPath), {
     baseDir: base,
     purpose: 'Preview target'
   })
@@ -6059,10 +6072,7 @@ async function watchPreviewFile(owner, rawUrl) {
 
   // Proactive teardown: the watch must not outlive the window that asked for
   // it by whole quit-cycles waiting on a change event that never comes.
-  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(
-    owner,
-    () => stopPreviewFileWatch(id)
-  )
+  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(owner, () => stopPreviewFileWatch(id))
 
   const watcher = fs.watch(watchDir, (_eventType, filename) => {
     const changedName = filename ? path.basename(String(filename)) : ''
@@ -6082,10 +6092,8 @@ async function watchPreviewFile(owner, rawUrl) {
         return
       }
 
-      sendPreviewFileChangedToOwner(
-        owner,
-        { id, path: filePath, url: pathToFileURL(filePath).toString() },
-        () => stopPreviewFileWatch(id)
+      sendPreviewFileChangedToOwner(owner, { id, path: filePath, url: pathToFileURL(filePath).toString() }, () =>
+        stopPreviewFileWatch(id)
       )
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
@@ -6094,6 +6102,7 @@ async function watchPreviewFile(owner, rawUrl) {
     owner,
     close: () => {
       offOwnerDestroyed()
+
       if (timer) {
         clearTimeout(timer)
       }
@@ -6151,10 +6160,7 @@ function watchDirectory(owner, rawDir) {
 
   // Same proactive teardown as a file watch: a closed window's directory
   // watch must not keep polling the disk-plugin door until quit.
-  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(
-    owner,
-    () => stopPreviewFileWatch(id)
-  )
+  const offOwnerDestroyed = onPreviewWatchOwnerDestroyed(owner, () => stopPreviewFileWatch(id))
 
   const watcher = fs.watch(watchDir, () => {
     if (timer) {
@@ -6163,10 +6169,8 @@ function watchDirectory(owner, rawDir) {
 
     timer = setTimeout(() => {
       timer = null
-      sendPreviewFileChangedToOwner(
-        owner,
-        { id, path: watchDir, url: pathToFileURL(watchDir).toString() },
-        () => stopPreviewFileWatch(id)
+      sendPreviewFileChangedToOwner(owner, { id, path: watchDir, url: pathToFileURL(watchDir).toString() }, () =>
+        stopPreviewFileWatch(id)
       )
     }, PREVIEW_WATCH_DEBOUNCE_MS)
   })
@@ -6175,6 +6179,7 @@ function watchDirectory(owner, rawDir) {
     owner,
     close: () => {
       offOwnerDestroyed()
+
       if (timer) {
         clearTimeout(timer)
       }
@@ -10180,7 +10185,10 @@ function persistSshConnectionToken(profile, source, token, registryConnectionId 
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile, options: { forceRegistryPrimary?: boolean; poolKey?: string; primary?: boolean } = {}) {
+async function resolveRemoteBackend(
+  profile,
+  options: { forceRegistryPrimary?: boolean; poolKey?: string; primary?: boolean } = {}
+) {
   const profileKey = String(profile || '').trim() || 'default'
 
   const managedPrimary = options.primary
@@ -12116,6 +12124,7 @@ async function runPoolBackendStart(
     WebSocketImpl: globalThis.WebSocket,
     ...spawnedBackendProbeOptions(childAlive)
   })
+
   assertPoolEntryStillOwned(poolKey, entry, backendPool, localBackendLifecycle.signal)
 
   if (!wsProbe.ok) {
@@ -12702,15 +12711,15 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
   migrateActiveProfileIfMissing()
 
   const connectionAttempt = backendConnectionState.startAttempt()
+
   // ONE launch-profile decision for this attempt (#108417): routing pin,
   // --profile argv, and the child env all derive from the same read, so a
   // hermes:profile:remember landing mid-startup becomes the NEXT boot's
   // preference instead of splitting routing identity from the launch
   // argument. (The pin below still honors a live primary — but a primary
   // being live means startHermes never got here.)
-  const { argvProfile: activeProfile, routingProfile: primaryProfile } = resolveLaunchProfile(
-    readActiveDesktopProfile
-  )
+  const { argvProfile: activeProfile, routingProfile: primaryProfile } = resolveLaunchProfile(readActiveDesktopProfile)
+
   // Pin the routing table to the profile this primary actually boots as; a
   // later hermes:profile:remember must not retarget requests mid-life.
   primaryProfilePin.pin(primaryProfile)
@@ -12771,6 +12780,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
+
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
     // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
@@ -16614,14 +16624,26 @@ async function interceptSessionRequestForRemote(request) {
     const passthroughQuery = passthroughParams.toString()
 
     if (profileHasRemoteOverride(profile)) {
+      // #64999: the override's remote can be a multi-profile backend — an
+      // unscoped read opens its launch-profile state.db, so a resume 4007s
+      // even though the row exists under its real owner. Scope the read the
+      // same way the list fetch does; a legacy single-profile scope ('')
+      // keeps the path bare.
+      const ownerScope =
+        remoteProfileQueryScope(profile, profileSshOverride(readDesktopConnectionConfig(), profile)?.remoteProfile) ||
+        profile
+
       if (method === 'GET') {
-        return fetchJsonForProfile(profile, passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname)
+        return fetchJsonForProfile(
+          profile,
+          pathWithRemoteOwnerScope(passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname, ownerScope)
+        )
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
 
-      if (body) {
-        delete body.profile
+      if (body && ownerScope) {
+        ;(body as Record<string, unknown>).profile = ownerScope
       }
 
       return requestJsonForProfile(profile, pathname, method, body)
@@ -16649,17 +16671,22 @@ async function interceptSessionRequestForRemote(request) {
 
 const rowsOf = data => (Array.isArray(data?.sessions) ? data.sessions : [])
 
-// A remote profile's session list, read from its remote host and tagged with the
-// desktop-facing profile name (the remote's /api/sessions doesn't know it).
+// A remote profile's session list. The fetch itself is profile-scoped
+// (fetchRemoteProfileSessions, #64999); the remote's own stamps carry the
+// authoritative identity — never relabel rows with the Desktop scope name.
 async function remoteSessionList(profile, searchParams) {
-  const data = await fetchRemoteProfileSessions(profile, searchParams, fetchJsonForProfile)
+  const sshOverride = profileSshOverride(readDesktopConnectionConfig(), profile)
 
-  for (const s of rowsOf(data)) {
-    s.profile = profile
-    s.is_default_profile = false
-  }
+  const data = await fetchRemoteProfileSessions(profile, searchParams, fetchJsonForProfile, {
+    remoteProfileAlias: sshOverride?.remoteProfile
+  })
 
-  return { ...(data as any), sessions: rowsOf(data) }
+  const rows = tagRemoteSessionRows(
+    rowsOf(data),
+    remoteProfileQueryScope(profile, sshOverride?.remoteProfile) || profile
+  )
+
+  return { ...(data as any), sessions: rows }
 }
 
 // #85834: find which remote profile owns a session id when the caller gave no
@@ -17092,9 +17119,13 @@ ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
 })
 
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  return readFileDataUrlForIpc(filePath, {
+  // Backend-reported paths are WSL/POSIX (`/home/...`, `/mnt/c/...`); on a
+  // Windows host bridge them to a UNC/drive form, same as directory reads.
+  const bridgedPath = resolveIpcFileReadPath(filePath)
+
+  return readFileDataUrlForIpc(bridgedPath, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
-    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(bridgedPath, { purpose: 'File preview' })),
     purpose: 'File preview'
   })
 })
@@ -17104,15 +17135,17 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
 // can exceed the default 16 MiB preview ceiling (and still fit the gateway
 // WebSocket frame limit after base64 expansion).
 ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
-  return readFileDataUrlForIpc(filePath, {
+  const bridgedPath = resolveIpcFileReadPath(filePath)
+
+  return readFileDataUrlForIpc(bridgedPath, {
     maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
-    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(bridgedPath, { purpose: 'Attachment upload' })),
     purpose: 'Attachment upload'
   })
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
+  const { resolvedPath, stat } = await resolveReadableFileForIpc(resolveIpcFileReadPath(filePath), {
     maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
     purpose: 'Text preview'
   })
@@ -17330,13 +17363,9 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
   normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
 )
 
-ipcMain.handle('hermes:watchPreviewFile', (event, url) =>
-  watchPreviewFile(event.sender, String(url || ''))
-)
+ipcMain.handle('hermes:watchPreviewFile', (event, url) => watchPreviewFile(event.sender, String(url || '')))
 
-ipcMain.handle('hermes:watchDirectory', (event, dir) =>
-  watchDirectory(event.sender, String(dir || ''))
-)
+ipcMain.handle('hermes:watchDirectory', (event, dir) => watchDirectory(event.sender, String(dir || '')))
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
@@ -18464,14 +18493,12 @@ app.whenReady().then(() => {
     startChromiumLogWatcher(CHROMIUM_LOG_PATH)
   }
 
-  const systemCa = installWindowsSystemCaTrust(tls)
+  const systemCa = installSystemCaTrust(tls)
 
   if (systemCa.applied) {
-    rememberLog(
-      `[tls] trusting ${systemCa.systemCertificateCount} Windows system CA certificate(s) for backend connections`
-    )
+    rememberLog(`[tls] trusting ${systemCa.systemCertificateCount} OS CA certificate(s) for backend connections`)
   } else if (systemCa.error) {
-    rememberLog(`[tls] could not load Windows system CA certificates: ${systemCa.error}`)
+    rememberLog(`[tls] could not load OS system CA certificates: ${systemCa.error}`)
   }
 
   // Keyring-less Linux `--password-store=basic` support. This must run before

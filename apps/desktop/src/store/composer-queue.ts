@@ -1,7 +1,15 @@
 import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { atom } from 'nanostores'
 
-import type { ComposerAttachment } from './composer'
+import { type ComposerAttachment, revokeAttachmentPreviewUrls, revokeDiscardedAttachmentPreviews } from './composer'
+
+export interface RemoveQueuedPromptOptions {
+  /**
+   * When true, leave blob: preview URLs alive because submit/optimistic now
+   * owns the snapshot (drain handoff). Default false = entry discarded.
+   */
+  retainPreviewUrls?: boolean
+}
 
 export interface QueuedPromptEntry {
   id: string
@@ -188,12 +196,17 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
     return null
   }
 
+  // Caller takes ownership of head.attachments (including any blob: previews).
   writeSession(sid, rest)
 
   return head
 }
 
-export const removeQueuedPrompt = (key: string | null | undefined, id: string): boolean => {
+export const removeQueuedPrompt = (
+  key: string | null | undefined,
+  id: string,
+  options?: RemoveQueuedPromptOptions
+): boolean => {
   const sid = sidOf(key)
 
   if (!sid) {
@@ -201,13 +214,18 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
   }
 
   const queue = queueFor(sid)
+  const removed = queue.find(e => e.id === id)
   const next = queue.filter(e => e.id !== id)
 
-  if (next.length === queue.length) {
+  if (!removed || next.length === queue.length) {
     return false
   }
 
   writeSession(sid, next)
+
+  if (!options?.retainPreviewUrls) {
+    revokeAttachmentPreviewUrls(removed.attachments)
+  }
 
   return true
 }
@@ -257,6 +275,10 @@ export const updateQueuedPrompt = (
       return entry
     }
 
+    if (update.attachments) {
+      revokeDiscardedAttachmentPreviews(entry.attachments, attachments)
+    }
+
     changed = true
 
     // The user rewrote the text, so any display projection it carried (a
@@ -284,6 +306,10 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
 
   if (!sid || !(sid in $queuedPromptsBySession.get())) {
     return
+  }
+
+  for (const entry of queueFor(sid)) {
+    revokeAttachmentPreviewUrls(entry.attachments)
   }
 
   writeSession(sid, [])
