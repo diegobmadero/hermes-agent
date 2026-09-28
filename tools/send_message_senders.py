@@ -243,11 +243,25 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
                 os.remove(thumb_path)
 
 
+# Telegram's supported HTML subset (Bot API "HTML style"). Detection must stay strict: in
+# unescaped HTML mode ONE unsupported tag makes Telegram reject the WHOLE message and the send
+# silently degrades to plain text (all formatting stripped). Loose angle-bracket text such as
+# ``<stamp>``, ``</x>``, ``<a b>`` or ``runs/<stamp>/`` is literal, never markup.
+_TELEGRAM_HTML_TAG_RE = re.compile(
+    r"</?(?:(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|code|pre)"
+    r"(?:\s+[\w-]+=(?:\"[^\"<>]*\"|'[^'<>]*'))*\s*/?>"
+    r"|blockquote(?:\s+expandable)?\s*/?>)",
+    re.IGNORECASE,
+)
+
+
 def _telegram_format(message):
-    """``(formatted, parse_mode, has_html)``: text already containing HTML tags is sent as
-    HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``."""
+    """``(formatted, parse_mode, has_html)``: text already containing supported Telegram HTML
+    tags is sent as HTML; otherwise Markdown -> MarkdownV2 via the adapter's ``format_message``
+    (which delivers angle brackets verbatim). Detection requires a *supported* tag so literal
+    tag-shaped text (paths, placeholders) stays off the unescaped HTML path."""
     from telegram.constants import ParseMode
-    if re.search(r'<[a-zA-Z/][^>]*>', message):
+    if _TELEGRAM_HTML_TAG_RE.search(message):
         return message, ParseMode.HTML, True
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
