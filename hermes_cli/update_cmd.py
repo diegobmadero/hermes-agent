@@ -1578,10 +1578,6 @@ def _apply_pulled_update(
         git_cmd, branch, movement_baseline, in_place_update=_plan.in_place_update,
         _windows_gateway_resume=_windows_gateway_resume)
 
-    post_pull_sha = _verify_head_after_pull(
-        git_cmd, branch, _plan.pre_sync_sha or pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
-
     if completion_request is not None:
         observed = _capture_head_sha(git_cmd, _m().PROJECT_ROOT) or post_pull_sha
         pinned = completion_request.get("expected_sha")
