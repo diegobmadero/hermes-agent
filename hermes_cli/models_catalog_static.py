@@ -151,10 +151,13 @@ _ALIBABA_CODING_PLAN_MODELS = [
     "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "qwen3-max-2026-01-23", "qwen3-coder-plus",
     "qwen3-coder-next", "kimi-k2.5", "glm-5", "glm-4.7", "MiniMax-M2.5",
 ]
-# Verified against a live Token Plan subscription (key tier ``sk-sp-...``).
+# Token Plan's /models response may be historical-first. Keep the current documented chat models
+# in a useful picker order; account-specific live rows are still appended by merge_profile_catalog.
 _ALIBABA_TOKEN_PLAN_MODELS = [
-    "qwen3.8-max-0902", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash", "deepseek-v4-pro",
-    "deepseek-v4-flash", "deepseek-v3.2", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "glm-5.2", "glm-5.1", "glm-5",
+    "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash",
+    "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash",
+    "deepseek-v4-flash-0731", "deepseek-v3.2", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "glm-5.3",
+    "glm-5.2", "glm-5.1", "glm-5", "MiniMax-M2.5", "auto",
 ]
 _XAI_MODELS = _xai_curated_models()
 

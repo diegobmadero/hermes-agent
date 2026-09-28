@@ -57,6 +57,40 @@ class TestGenericProviderLiveCuratedMerge:
         # No duplicates for models present in both.
         assert result.count("glm-5") == 1
 
+    def test_alibaba_token_plan_prioritizes_current_canonical_models(self):
+        """The curated floor must pull current aliases ahead of snapshots and prior generations.
+
+        Alibaba's live Token Plan catalog can return a historical-first order. The picker is
+        curated-first specifically so its stable order remains useful while preserving every live row.
+        """
+        live = [
+            "qwen3.8-max-0902",
+            "deepseek-v4-flash",
+            "glm-5.2",
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "deepseek-v4.1-flash",
+            "glm-5.3",
+            "auto",
+        ]
+        with (
+            patch("providers.get_provider_profile", return_value=self._make_profile(live)),
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                return_value={"api_key": "k", "base_url": ""},
+            ),
+        ):
+            result = provider_model_ids("alibaba-token-plan")
+
+        for current, older in (
+            ("qwen3.8-max", "qwen3.8-max-0902"),
+            ("qwen3.8-flash", "qwen3.6-flash"),
+            ("deepseek-v4.1-flash", "deepseek-v4-flash"),
+            ("glm-5.3", "glm-5.2"),
+        ):
+            assert result.index(current) < result.index(older)
+        assert set(live) <= set(result)
+
     def test_no_models_dropped_either_direction(self):
         """Every live AND curated model survives the merge for both modes."""
         live = ["a", "b"]
