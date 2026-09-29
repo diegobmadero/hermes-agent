@@ -3703,10 +3703,16 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
-            # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
-            # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            from gateway.run_plugin_admission import plugin_injection_admitted
+            while True:
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
+                # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
+                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                # In-turn drain is a final pickup too: a vetoed plugin wake is dropped before
+                # it becomes the next model turn, and the chain continues with the next event.
+                if pending_event is None or await plugin_injection_admitted(pending_event):
+                    break
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):

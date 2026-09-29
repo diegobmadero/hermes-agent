@@ -137,6 +137,14 @@ VALID_HOOKS: Set[str] = {
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
     "pre_gateway_dispatch",
+    # pre_plugin_injection_admit: at the FINAL pickup of a plugin-injected queued turn, immediately
+    # before the gateway starts a model for it -- both the cold start and the in-turn FIFO drain,
+    # after any busy requeue. Fired only for events the gateway itself stamped as plugin injections
+    # (internal=True + hermes_plugin_injection metadata), never for user/operator input. Kwargs:
+    # plugin_id, session_key, session_id, text, event. Return {"action": "reject", "reason"} to drop
+    # the event definitively before any model starts; anything else admits. The rejection is not a
+    # transport failure: nothing is retried or re-queued. Fail-open on hook errors.
+    "pre_plugin_injection_admit",
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,
     # platform, reason, invalidation_reason. Return values are ignored.
