@@ -44,6 +44,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_PEER_DELIVERY_ROUTE_LOCK = threading.Lock()
 
 
 def rehome_inbound_media(event: MessageEvent) -> None:
@@ -1977,16 +1978,13 @@ class GatewayInboundMixin:
                 logger.warning("Plugin delivery callback failed", exc_info=True)
 
         if delivery == "peer":
-            ledger = getattr(self, "_peer_delivery_ledger", None)
-            if ledger is None:
-                ledger = self._peer_delivery_ledger = {}
             key = (session_key, entry.session_id, plugin_id, delivery_id)
             peer_key = key
-            route_locks = getattr(self, "_peer_delivery_route_locks", None)
-            if route_locks is None:
-                route_locks = self._peer_delivery_route_locks = {}
-            route_lock = route_locks.setdefault(key, threading.RLock())
+            route_lock = _PEER_DELIVERY_ROUTE_LOCK
             with route_lock:
+                ledger = getattr(self, "_peer_delivery_ledger", None)
+                if ledger is None:
+                    ledger = self._peer_delivery_ledger = {}
                 prior = ledger.get(key)
                 if prior is None:
                     ledger[key] = "pending"

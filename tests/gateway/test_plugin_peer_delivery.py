@@ -320,3 +320,35 @@ async def test_idle_peer_duplicate_waits_for_single_adapter_admission_and_refusa
     count = adapter.handle_message.await_count
     assert await runner._dispatch_plugin_message_injection(**uncertain)
     assert adapter.handle_message.await_count == count
+
+
+@pytest.mark.asyncio
+async def test_many_peer_delivery_ids_reuse_bounded_route_synchronization():
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    key = "agent:main:telegram:dm:42"
+    entry = SessionEntry(session_key=key, session_id="session-42", created_at=datetime.now(),
+                         updated_at=datetime.now(), origin=source, platform=Platform.TELEGRAM)
+    agent = SimpleNamespace(session_id="session-42", _inflight_turn_id="turn-1",
+                            queue_peer_notification=MagicMock(return_value=True))
+    runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry))
+    runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: SimpleNamespace(handle_message=AsyncMock())}, {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_state = lambda route: SimpleNamespace(turn=SimpleNamespace(agent=agent))
+    runner._current_session_run_generation = lambda route: 4
+    runner._is_session_run_current = lambda route, generation: generation == 4
+    for number in range(1000):
+        assert await runner._dispatch_plugin_message_injection(
+            session_key=key, content="peer answer", plugin_id="peer-test",
+            delivery="peer", delivery_id=f"delivery-{number}")
+    assert len(runner._peer_delivery_ledger) == 1000
+    assert not hasattr(runner, "_peer_delivery_route_locks")
+    assert not hasattr(runner, "_peer_delivery_route_lock")
+    assert agent.queue_peer_notification.call_count == 1000
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="delivery-0")
+    assert agent.queue_peer_notification.call_count == 1000
