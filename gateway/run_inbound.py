@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -1981,10 +1982,17 @@ class GatewayInboundMixin:
                 ledger = self._peer_delivery_ledger = {}
             key = (session_key, entry.session_id, plugin_id, delivery_id)
             peer_key = key
-            prior = ledger.get(key)
-            if prior is not None:
-                report(prior)
-                return True
+            route_locks = getattr(self, "_peer_delivery_route_locks", None)
+            if route_locks is None:
+                route_locks = self._peer_delivery_route_locks = {}
+            route_lock = route_locks.setdefault(key, threading.RLock())
+            with route_lock:
+                prior = ledger.get(key)
+                if prior is not None:
+                    if prior in {"peer", "queue"}:
+                        report(prior)
+                    return True
+                ledger[key] = "pending"
             state = self._session_state(session_key)
             agent = state.turn.agent
             generation = self._current_session_run_generation(session_key)
@@ -2008,12 +2016,33 @@ class GatewayInboundMixin:
                 def fallback(reason):
                     # The agent finalizer owns the pending record; this callback only queues
                     # its one remaining delivery, scoped to the original session id.
-                    ledger[key] = "queue"
-                    report("queue", reason)
-                    self._schedule_plugin_message_injection(
+                    with route_lock:
+                        if ledger[key] not in {"pending", "peer"}:
+                            return
+                        ledger[key] = "queue_pending"
+
+                    def queue_result(outcome):
+                        with route_lock:
+                            if ledger[key] != "queue_pending":
+                                return
+                            if outcome is True:
+                                ledger[key] = "queue"
+                                report("queue", reason)
+                            else:
+                                ledger[key] = "retained"
+                                logger.warning(
+                                    "Peer fallback queue admission %s; retaining delivery: "
+                                    "plugin=%s session=%s delivery_id=%s",
+                                    "refused" if outcome is False else "unknown",
+                                    plugin_id, session_key, delivery_id,
+                                )
+
+                    scheduled = self._schedule_plugin_message_injection(
                         session_key=session_key, content=content, plugin_id=plugin_id,
-                        bound_session_id=entry.session_id,
+                        bound_session_id=entry.session_id, on_result=queue_result,
                     )
+                    if not scheduled:
+                        queue_result(False)
 
                 def included(event):
                     if on_delivery is not None:
@@ -2026,9 +2055,15 @@ class GatewayInboundMixin:
                     content, plugin_id, delivery_id, valid=valid,
                     on_included=included, on_fallback=fallback,
                 ):
-                    ledger[key] = "peer"
-                    report("peer")
+                    with route_lock:
+                        # Finalization may have claimed fallback before append returned.
+                        if ledger[key] == "pending":
+                            ledger[key] = "peer"
+                            report("peer")
                     return True
+            with route_lock:
+                ledger.pop(key, None)
+                route_locks.pop(key, None)
             queue_reason = "no_live_peer_turn"
 
         event = MessageEvent(

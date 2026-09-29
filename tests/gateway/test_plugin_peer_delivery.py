@@ -92,13 +92,19 @@ async def test_busy_peer_uses_bound_agent_without_a_gateway_wake():
     adapter.handle_message.assert_not_awaited()
 
     bound = agent.queue_peer_notification.call_args.kwargs
-    runner._schedule_plugin_message_injection = MagicMock(return_value=True)
+    runner._schedule_plugin_message_injection = MagicMock(
+        side_effect=lambda **kwargs: kwargs["on_result"](True) or True)
     runner._is_session_run_current = lambda key, generation: False  # /stop or /new fence
     assert bound["valid"]() is False
     bound["on_fallback"]("turn_changed")
     assert runner._schedule_plugin_message_injection.call_args.kwargs["bound_session_id"] == "session-42"
     assert events[-1]["effective"] == "queue"
     assert events[-1]["reason"] == "turn_changed"
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="id-1", on_delivery=events.append)
+    assert events[-1]["effective"] == "queue"
+    runner._schedule_plugin_message_injection.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -154,3 +160,93 @@ async def test_idle_peer_uses_one_ordinary_turn_and_old_session_cannot_follow_ne
     await asyncio.gather(*list(runner._background_tasks))
     assert outcomes == [False]
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_outcome", [False, None])
+async def test_removed_bound_route_retains_peer_without_claiming_queue(fallback_outcome):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    key = "agent:main:telegram:dm:42"
+    def entry(session_id):
+        return SessionEntry(session_key=key, session_id=session_id,
+                            created_at=datetime.now(), updated_at=datetime.now(),
+                            origin=source, platform=Platform.TELEGRAM)
+
+    lookup = AsyncMock(return_value=entry("old"))
+    agent = SimpleNamespace(session_id="old", _inflight_turn_id="turn-1",
+                            queue_peer_notification=MagicMock(return_value=True))
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=lookup)
+    runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: adapter}, {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_state = lambda route: SimpleNamespace(turn=SimpleNamespace(agent=agent))
+    runner._current_session_run_generation = lambda route: 4
+    runner._is_session_run_current = lambda route, generation: generation == 4
+    events = []
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="delivery-1", on_delivery=events.append)
+    lookup.return_value = entry("new")
+    scheduled = []
+    def schedule(**kwargs):
+        scheduled.append(kwargs)
+        if fallback_outcome is None:
+            kwargs["on_result"](None)
+            return True
+        return False
+    runner._schedule_plugin_message_injection = schedule
+    agent.queue_peer_notification.call_args.kwargs["on_fallback"]("turn_changed")
+    assert len(scheduled) == 1
+    assert scheduled[0]["bound_session_id"] == "old"
+    assert not any(event["effective"] == "queue" for event in events)
+    assert runner._peer_delivery_ledger[(key, "old", "peer-test", "delivery-1")] != "queue"
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="delivery-1", bound_session_id="old") is False
+    adapter.handle_message.assert_not_awaited()
+    lookup.return_value = entry("old")
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="delivery-1")
+    assert len(scheduled) == 1
+    agent.queue_peer_notification.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_fallback_before_append_returns_cannot_be_overwritten_by_peer():
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    key = "agent:main:telegram:dm:42"
+    entry = SessionEntry(session_key=key, session_id="old", created_at=datetime.now(),
+                         updated_at=datetime.now(), origin=source, platform=Platform.TELEGRAM)
+    def append_then_finalize(*args, **kwargs):
+        kwargs["on_fallback"]("turn_ended")
+        return True
+    agent = SimpleNamespace(session_id="old", _inflight_turn_id="turn-1",
+                            queue_peer_notification=append_then_finalize)
+    runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry))
+    runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: SimpleNamespace(handle_message=AsyncMock())}, {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_state = lambda route: SimpleNamespace(turn=SimpleNamespace(agent=agent))
+    runner._current_session_run_generation = lambda route: 4
+    runner._is_session_run_current = lambda route, generation: generation == 4
+    scheduled = []
+    def schedule(**kwargs):
+        scheduled.append(kwargs)
+        kwargs["on_result"](True)
+        return True
+    runner._schedule_plugin_message_injection = schedule
+    events = []
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="delivery-1", on_delivery=events.append)
+    assert len(scheduled) == 1
+    assert events[-1]["effective"] == "queue"
+    assert runner._peer_delivery_ledger[(key, "old", "peer-test", "delivery-1")] == "queue"
