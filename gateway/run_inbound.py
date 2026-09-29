@@ -1390,6 +1390,15 @@ class GatewayInboundMixin:
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
+        # Final pickup for a cold-start plugin wake: the owning plugin may veto a stale
+        # injection before any model starts. Release the claimed slot on rejection.
+        from gateway.run_plugin_admission import plugin_injection_admitted
+        if not await plugin_injection_admitted(event):
+            if _active_session_lease is not None:
+                with suppress(Exception):
+                    _active_session_lease.release()
+            return None
+
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
