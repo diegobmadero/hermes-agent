@@ -250,3 +250,73 @@ async def test_finalizer_fallback_before_append_returns_cannot_be_overwritten_by
     assert len(scheduled) == 1
     assert events[-1]["effective"] == "queue"
     assert runner._peer_delivery_ledger[(key, "old", "peer-test", "delivery-1")] == "queue"
+
+
+@pytest.mark.asyncio
+async def test_idle_peer_duplicate_waits_for_single_adapter_admission_and_refusal_can_retry():
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    key = "agent:main:telegram:dm:42"
+    entry = SessionEntry(session_key=key, session_id="session-42", created_at=datetime.now(),
+                         updated_at=datetime.now(), origin=source, platform=Platform.TELEGRAM)
+    runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry))
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_state = lambda route: SimpleNamespace(turn=SimpleNamespace(agent=None))
+    runner._current_session_run_generation = lambda route: 0
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def accept(event):
+        calls.append(event)
+        entered.set()
+        await release.wait()
+        event._gateway_accepted = True
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accept))
+    runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: adapter}, {}
+    receipts = []
+    kwargs = dict(session_key=key, content="peer answer", plugin_id="peer-test",
+                  delivery="peer", delivery_id="delivery-1", on_delivery=receipts.append)
+    first = asyncio.create_task(runner._dispatch_plugin_message_injection(**kwargs))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        second = asyncio.create_task(runner._dispatch_plugin_message_injection(**kwargs))
+        assert await asyncio.wait_for(second, 2)
+        assert len(calls) == 1
+        assert receipts == []
+    finally:
+        release.set()
+        assert await first
+        if second is not None:
+            assert await second
+    assert runner._peer_delivery_ledger[(key, "session-42", "peer-test", "delivery-1")] == "queue"
+    assert [event["effective"] for event in receipts] == ["queue"]
+
+    # A definite unstarted refusal releases this ID for the receiver's bounded retry.
+    attempts = []
+    async def refuse_then_accept(event):
+        attempts.append(event)
+        if len(attempts) == 1:
+            return
+        event._gateway_accepted = True
+    adapter.handle_message.side_effect = refuse_then_accept
+    retry = {**kwargs, "delivery_id": "delivery-2"}
+    assert not await runner._dispatch_plugin_message_injection(**retry)
+    assert await runner._dispatch_plugin_message_injection(**retry)
+    assert len(attempts) == 2
+    assert runner._peer_delivery_ledger[(key, "session-42", "peer-test", "delivery-2")] == "queue"
+
+    async def unknown(_event):
+        raise RuntimeError("adapter outcome unknown")
+    adapter.handle_message.side_effect = unknown
+    uncertain = {**kwargs, "delivery_id": "delivery-3"}
+    with pytest.raises(RuntimeError, match="adapter outcome unknown"):
+        await runner._dispatch_plugin_message_injection(**uncertain)
+    assert runner._peer_delivery_ledger[(key, "session-42", "peer-test", "delivery-3")] == "retained"
+    count = adapter.handle_message.await_count
+    assert await runner._dispatch_plugin_message_injection(**uncertain)
+    assert adapter.handle_message.await_count == count
