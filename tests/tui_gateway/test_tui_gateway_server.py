@@ -1242,6 +1242,16 @@ def test_write_json_drops_detached_ws_frames(monkeypatch):
         server._sessions.pop("detached-sid", None)
 
 
+@pytest.mark.parametrize("count", [0, 3])
+def test_get_usage_projects_live_compression_count(count):
+    agent = types.SimpleNamespace(
+        context_compressor=types.SimpleNamespace(compression_count=count),
+        model="test-model",
+    )
+
+    assert server._get_usage(agent)["compressions"] == count
+
+
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # The live ticker must nest the snapshot under a "usage" key, matching the
     # message.complete / session.info payloads the desktop & TUI handlers read
@@ -4262,6 +4272,7 @@ def test_config_sync_switches_unpinned_session(monkeypatch):
                 "confirm_expensive_model": True,
                 "pin_session_override": False,
                 "persist_override": False,
+                "count_switch": False,
             },
         )
     ]
@@ -8494,7 +8505,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     import hermes_yaml as yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp_on = server.handle_request(
@@ -8506,7 +8517,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     )
     assert resp_on["result"]["value"] == "1"
     assert resp_on["result"]["scope"] == "global"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "off"
 
     resp_off = server.handle_request(
         {
@@ -8516,7 +8527,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
         }
     )
     assert resp_off["result"]["value"] == "0"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "manual"
 
 
 def test_config_get_approval_mode_uses_smart_default_when_key_is_missing(
@@ -8603,7 +8614,7 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
         server._sessions.clear()
 
     assert resp["result"] == {"key": "approvals.mode", "value": "manual"}
-    assert yaml.safe_load((tmp_path / "config.yaml").read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "manual"
     assert emitted and emitted[0][0:2] == ("session.info", "sid")
     assert emitted[0][2]["approval_mode"] == "manual"
 
@@ -8697,7 +8708,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     import hermes_yaml as yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
+    cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp = server.handle_request(
@@ -8708,7 +8719,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "off"
 
     # Setting it on again is idempotent — stays off.
     resp_again = server.handle_request(
@@ -8719,7 +8730,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp_again["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "off"
 
 
 def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
@@ -8939,7 +8950,7 @@ def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
     import hermes_yaml as yaml
 
     cfg_path = tmp_path / "config.yaml"
-    cfg_path.write_text(yaml.safe_dump({"display": "broken"}))
+    cfg_path.write_text(yaml.safe_dump({"display": "broken"}), encoding="utf-8")
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
 
     resp = server.handle_request(
@@ -8951,7 +8962,7 @@ def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
     )
 
     assert resp["result"]["value"] == "bottom"
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))
     assert saved["display"]["tui_statusbar"] == "bottom"
 
 
@@ -8975,7 +8986,7 @@ def test_config_set_details_mode_pins_all_sections(tmp_path, monkeypatch):
     )
 
     assert resp["result"] == {"key": "details_mode", "value": "collapsed"}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))
     assert saved["display"]["details_mode"] == "collapsed"
     assert saved["display"]["sections"] == {
         "thinking": "collapsed",
@@ -9000,7 +9011,7 @@ def test_config_set_section_writes_per_section_override(tmp_path, monkeypatch):
     )
 
     assert resp["result"] == {"key": "details_mode.activity", "value": "hidden"}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))
     assert saved["display"]["sections"] == {"activity": "hidden"}
 
 
@@ -9024,7 +9035,7 @@ def test_config_set_section_clears_override_on_empty_value(tmp_path, monkeypatch
     )
 
     assert resp["result"] == {"key": "details_mode.activity", "value": ""}
-    saved = yaml.safe_load(cfg_path.read_text())
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))
     assert saved["display"]["sections"] == {"tools": "expanded"}
 
 
@@ -9399,7 +9410,7 @@ def test_setup_readiness_scopes_to_requested_profile(monkeypatch, tmp_path):
         )
         assert status["result"] == {"provider_configured": False, "profile": "bot"}
 
-        (bot_home / ".env").write_text("OPENROUTER_API_KEY=sk-or-bot-profile-secret-00001\n")
+        (bot_home / ".env").write_text("OPENROUTER_API_KEY=sk-or-bot-profile-secret-00001\n", encoding="utf-8")
         status = server.handle_request(
             {"id": "2", "method": "setup.status", "params": {"profile": "bot"}}
         )
@@ -10857,7 +10868,7 @@ def test_session_compress_uses_compress_helper(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (2, {"total": 42, "compressions": 2}),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
 
@@ -10867,7 +10878,7 @@ def test_session_compress_uses_compress_helper(monkeypatch):
         )
 
     assert resp["result"]["removed"] == 2
-    assert resp["result"]["usage"]["total"] == 42
+    assert resp["result"]["usage"] == {"total": 42, "compressions": 2}
     emit.assert_any_call("session.info", "sid", {"model": "x"})
     # Final status.update clears the pinned "compressing" indicator so the
     # status bar can revert to the neutral state when compaction finishes.
@@ -11446,7 +11457,7 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         assert resp["result"]["uploaded"] is True
         assert resp["result"]["path"] == str(stored)
         assert resp["result"]["ref_text"] == f"@file:{stored}"
-        assert stored.read_text(encoding="utf-8") == "hello world"
+        assert stored.read_text(encoding="utf-8-sig") == "hello world"
     finally:
         server._sessions.pop("sid", None)
 
@@ -11479,7 +11490,7 @@ def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, 
         assert resp["result"]["attached"] is True
         assert resp["result"]["uploaded"] is True
         assert resp["result"]["ref_text"] == f"@file:{stored}"
-        assert stored.read_text(encoding="utf-8") == "outside workspace"
+        assert stored.read_text(encoding="utf-8-sig") == "outside workspace"
     finally:
         server._sessions.pop("sid", None)
 
@@ -11572,7 +11583,7 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         stored = tmp_path / "home" / "attachments" / "my exam schedule.csv"
         assert resp["result"]["attached"] is True
         assert resp["result"]["ref_text"] == f"@file:`{stored}`"
-        assert stored.read_text(encoding="utf-8") == "a,b\n"
+        assert stored.read_text(encoding="utf-8-sig") == "a,b\n"
     finally:
         server._sessions.pop("sid", None)
 
@@ -18884,7 +18895,7 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     assert saved_file.parent == saved_dir
     assert saved_file.exists()
 
-    payload = json.loads(saved_file.read_text())
+    payload = json.loads(saved_file.read_text(encoding="utf-8-sig"))
     assert payload["model"] == "hermes-test"
     assert payload["session_id"] == "20260101_120000_abc123"
     assert payload["session_start"] == "2026-01-01T12:00:00"
@@ -21446,7 +21457,7 @@ def test_save_cfg_preserves_user_comments(tmp_path, monkeypatch):
         }
     )
 
-    text = cfg_path.read_text(encoding="utf-8")
+    text = cfg_path.read_text(encoding="utf-8-sig")
     assert "# top of file note" in text
     assert "# provider rationale" in text
     assert "# trailing skin note" in text
@@ -21485,7 +21496,7 @@ def test_save_cfg_preserves_top_level_key_order(tmp_path, monkeypatch):
         }
     )
 
-    text = cfg_path.read_text(encoding="utf-8")
+    text = cfg_path.read_text(encoding="utf-8-sig")
     top_keys = [
         line.split(":", 1)[0]
         for line in text.splitlines()
@@ -21518,7 +21529,7 @@ def test_save_cfg_keeps_unicode_personalities_readable(tmp_path, monkeypatch):
         }
     )
 
-    text = cfg_path.read_text(encoding="utf-8")
+    text = cfg_path.read_text(encoding="utf-8-sig")
     assert "你好" in text
     assert "(=^･ω･^=)" in text
     assert "\\u4f60" not in text
@@ -22538,7 +22549,7 @@ def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_p
             home = get_hermes_home()
             built_homes.append(str(home))
             soul = (
-                (home / "SOUL.md").read_text(encoding="utf-8")
+                (home / "SOUL.md").read_text(encoding="utf-8-sig")
                 if (home / "SOUL.md").exists()
                 else ""
             )
