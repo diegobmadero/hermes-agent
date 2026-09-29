@@ -84,18 +84,24 @@ def emit_included_peer_receipts(agent, api_kwargs, *, turn_id, request_id):
     wire = api_kwargs.get("messages", api_kwargs.get("input", ()))
     if not isinstance(wire, list):
         return
+    available = [index for index, item in enumerate(wire)
+                 if isinstance(item, dict) and item.get("role") == "user"]
     for row, notice in rows:
         # A middleware may have removed the row; an attempted request without it has no receipt.
         # The request builder strips terminal newlines from copied message content.
-        if not any(isinstance(item, dict) and item.get("role") == "user" and
-                   item.get("content") == row["content"].rstrip("\n") for item in wire):
+        match = next((index for index in available
+                      if wire[index].get("content") == row["content"].rstrip("\n")), None)
+        if match is None:
             continue
+        available.remove(match)
         from agent.context_compressor import _DB_PERSISTED_MARKER
         if not row.get(_DB_PERSISTED_MARKER):
             continue
+        if notice.get("included"):
+            continue
+        notice["included"] = True
         if notice["on_included"]:
             notice["on_included"]({
                 "event": "included", "delivery_id": notice["delivery_id"],
                 "session_id": agent.session_id, "turn_id": turn_id, "request_id": request_id,
             })
-        notice["included"] = True
