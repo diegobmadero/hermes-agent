@@ -11,6 +11,7 @@ from tools.registry import registry
 
 
 TOOL = "peer_delivery_blocking_probe"
+TOOL2 = "peer_delivery_second_probe"
 entered = threading.Event()
 release = threading.Event()
 
@@ -27,15 +28,22 @@ registry.register(
             "parameters": {"type": "object", "properties": {}, "required": []}},
     handler=blocking_probe, override=True,
 )
+registry.register(
+    name=TOOL2, toolset="utility",
+    schema={"name": TOOL2, "description": "second test probe",
+            "parameters": {"type": "object", "properties": {}, "required": []}},
+    handler=lambda args, **kwargs: "second tool finished", override=True,
+)
 
 
 def test_peer_arriving_during_tool_is_included_once_in_same_turn(tmp_path):
     entered.clear()
     release.clear()
-    schema = {"type": "function", "function": {"name": TOOL, "description": "probe",
-              "parameters": {"type": "object", "properties": {}, "required": []}}}
+    schemas = [{"type": "function", "function": {"name": name, "description": "probe",
+               "parameters": {"type": "object", "properties": {}, "required": []}}}
+               for name in (TOOL, TOOL2)]
     db = SessionDB(tmp_path / "state.db")
-    with (patch("model_tools.get_tool_definitions", return_value=[schema]),
+    with (patch("model_tools.get_tool_definitions", return_value=schemas),
           patch("model_tools.check_toolset_requirements", return_value={}),
           patch("agent.process_bootstrap.OpenAI")):
         agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
@@ -49,7 +57,7 @@ def test_peer_arriving_during_tool_is_included_once_in_same_turn(tmp_path):
     agent.save_trajectories = False
     captured = []
     tool_response = _mock_response(content="", finish_reason="tool_calls",
-                                   tool_calls=[_mock_tool_call(name=TOOL)])
+                                   tool_calls=[_mock_tool_call(name=TOOL), _mock_tool_call(name=TOOL2)])
     final_response = _mock_response(content="task continued", finish_reason="stop")
 
     def provider(**kwargs):
@@ -70,7 +78,7 @@ def test_peer_arriving_during_tool_is_included_once_in_same_turn(tmp_path):
         try:
             assert entered.wait(5)
             assert agent.queue_peer_notification(
-                "BAF-skill MESSAGE FROM AGENT TS8\nanswer envelope", "peer-plugin", "delivery-1",
+                "BAF-skill MESSAGE FROM AGENT TS8\nanswer envelope\n", "peer-plugin", "delivery-1",
                 on_included=receipts.append)
         finally:
             release.set()
@@ -85,6 +93,8 @@ def test_peer_arriving_during_tool_is_included_once_in_same_turn(tmp_path):
     assert rows[0]["display_metadata"]["plugin_id"] == "peer-plugin"
     assert STEER_MARKER_OPEN not in rows[0]["content"]
     assert sum("answer envelope" in str(row.get("content")) for row in captured[1]) == 1
+    roles = [row["role"] for row in captured[1]]
+    assert roles[-3:] == ["tool", "tool", "user"]
     assert outcome["result"]["final_response"] == "task continued"
     assert len(receipts) == 1
     assert receipts[0]["delivery_id"] == "delivery-1"
@@ -93,3 +103,68 @@ def test_peer_arriving_during_tool_is_included_once_in_same_turn(tmp_path):
     assert receipts[0]["request_id"]
     assert agent._interrupt_requested is False
     assert not getattr(agent, "_active_children", ())
+
+
+def test_peer_during_final_model_generation_queues_once_without_cancellation():
+    with (patch("model_tools.get_tool_definitions", return_value=[]),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI")):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    started, finish = threading.Event(), threading.Event()
+    fallbacks = []
+
+    def provider(**kwargs):
+        started.set()
+        assert finish.wait(5)
+        return _mock_response(content="original task complete", finish_reason="stop")
+
+    agent.client.chat.completions.create.side_effect = provider
+    result = {}
+    with (patch.object(agent, "_persist_session"),
+          patch.object(agent, "_cleanup_task_resources")):
+        worker = threading.Thread(target=lambda: result.setdefault(
+            "turn", agent.run_conversation("original task")))
+        worker.start()
+        try:
+            assert started.wait(5)
+            assert agent._model_request_active.is_set()
+            assert agent.queue_peer_notification("peer answer", "peer-plugin", "id-2",
+                                                 on_fallback=fallbacks.append)
+            assert agent._interrupt_requested is False
+        finally:
+            finish.set()
+            worker.join(10)
+    assert not worker.is_alive()
+    assert result["turn"]["final_response"] == "original task complete"
+    assert fallbacks == ["turn_ended"]
+    assert all(row.get("display_kind") != "peer_notification" for row in result["turn"]["messages"])
+
+
+def test_peer_buffer_never_broadcasts_to_active_children():
+    agent = object.__new__(AIAgent)
+    child = MagicMock()
+    agent._active_children = [child]
+    assert agent.queue_peer_notification("peer answer", "peer-plugin", "id-child")
+    child.steer.assert_not_called()
+    child.queue_peer_notification.assert_not_called()
+
+
+def test_persisted_unincluded_peer_is_not_queued_a_second_time():
+    agent = object.__new__(AIAgent)
+    agent._interrupt_requested = False
+    fallback = []
+    assert agent.queue_peer_notification("peer answer", "peer-plugin", "id-persisted",
+                                         on_fallback=fallback.append)
+    messages = [{"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "done"}]
+    assert agent._insert_pending_peer(messages)
+    messages[-1]["_db_persisted"] = True
+    agent._fallback_pending_peer()
+    assert fallback == []
+    assert messages[-1]["display_kind"] == "peer_notification"
