@@ -47,6 +47,13 @@ logger = logging.getLogger("gateway.run")
 _PEER_DELIVERY_ROUTE_LOCK = threading.Lock()
 
 
+def _live_peer_turn_id(agent):
+    """Turn id that accepts peer notices: bound at turn start, closed by the finalizer."""
+    if getattr(agent, "_peer_turn_closed", True):
+        return None
+    return getattr(agent, "_current_turn_id", None) or None
+
+
 def rehome_inbound_media(event: MessageEvent) -> None:
     """Move adapter-cached attachments into the ACTIVE profile's ``cache/`` and repoint the event.
 
@@ -1995,7 +2002,9 @@ class GatewayInboundMixin:
             state = self._session_state(session_key)
             agent = state.turn.agent
             generation = self._current_session_run_generation(session_key)
-            turn_id = getattr(agent, "_inflight_turn_id", None)
+            # _inflight_turn_id is a persist tripwire cleared by every mid-turn save;
+            # the bound turn id stays set until the finalizer closes the peer path.
+            turn_id = _live_peer_turn_id(agent)
             can_peer = (
                 turn_id and getattr(agent, "session_id", None) == entry.session_id
                 and getattr(agent, "api_mode", None) != "codex_app_server"
@@ -2008,7 +2017,7 @@ class GatewayInboundMixin:
                     return (self._is_session_run_current(session_key, generation)
                             and self._session_state(session_key).turn.agent is agent
                             and getattr(agent, "session_id", None) == entry.session_id
-                            and getattr(agent, "_inflight_turn_id", None) == turn_id
+                            and _live_peer_turn_id(agent) == turn_id
                             and (permission_check is None or permission_check())
                             and not getattr(agent, "_interrupt_requested", False))
 

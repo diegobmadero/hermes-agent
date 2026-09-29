@@ -314,3 +314,97 @@ def test_human_steer_takes_shared_tool_boundary_and_peer_falls_back_once():
     assert all("peer answer" not in str(row.get("content")) for row in captured[1])
     assert all(row.get("display_kind") != "peer_notification" for row in outcome["result"]["messages"])
     assert fallbacks == ["turn_ended"]
+
+
+def test_gateway_admits_peer_into_a_real_turn_after_its_mid_turn_saves(tmp_path):
+    """A real turn persists before its first model call and after tool steps; the gateway
+    must still see it as live and route the notice into it, not to the queue."""
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry, SessionSource
+
+    entered.clear()
+    release.clear()
+    schemas = [{"type": "function", "function": {"name": TOOL, "description": "probe",
+               "parameters": {"type": "object", "properties": {}, "required": []}}}]
+    db = SessionDB(tmp_path / "state.db")
+    with (patch("model_tools.get_tool_definitions", return_value=schemas),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI")):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        session_db=db, session_id="live-session")
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    captured = []
+    tool_response = _mock_response(content="", finish_reason="tool_calls",
+                                   tool_calls=[_mock_tool_call(name=TOOL)])
+    final_response = _mock_response(content="task continued", finish_reason="stop")
+
+    def provider(**kwargs):
+        captured.append(kwargs["messages"])
+        return tool_response if len(captured) == 1 else final_response
+
+    agent.client.chat.completions.create.side_effect = provider
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    entry = SessionEntry(session_key="agent:main:telegram:dm:42", session_id="live-session",
+                         created_at=datetime.now(), updated_at=datetime.now(),
+                         origin=source, platform=Platform.TELEGRAM)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._running, runner._draining = True, False
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry))
+    runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: adapter}, {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    runner._session_state = lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent))
+    runner._current_session_run_generation = lambda key: 1
+    runner._is_session_run_current = lambda key, generation: generation == 1
+    runner._schedule_plugin_message_injection = MagicMock(return_value=True)
+    events, outcome, receipts = [], {}, []
+
+    def run():
+        outcome["result"] = agent.run_conversation("original task")
+
+    with patch.object(agent, "_cleanup_task_resources"):
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            assert entered.wait(5)
+            # The real turn-start persist already ran; the tripwire field is clear.
+            assert getattr(agent, "_inflight_turn_id", None) is None
+            accepted = asyncio.run(runner._dispatch_plugin_message_injection(
+                session_key=entry.session_key,
+                content="BAF-skill MESSAGE FROM AGENT TS8\nlive answer\n",
+                plugin_id="peer-plugin", delivery="peer", delivery_id="live-1",
+                on_delivery=events.append))
+        finally:
+            release.set()
+            worker.join(10)
+    assert not worker.is_alive()
+    assert accepted is True
+    assert events and events[0]["effective"] == "peer", events
+    adapter.handle_message.assert_not_awaited()
+    runner._schedule_plugin_message_injection.assert_not_called()
+    assert len(captured) == 2
+    assert sum("live answer" in str(row.get("content")) for row in captured[1]) == 1
+    assert sum(row.get("display_kind") == "peer_notification"
+               for row in db.get_messages("live-session")) == 1
+    assert outcome["result"]["final_response"] == "task continued"
+
+    # After the turn ends the same gate reports no live turn and the gateway queues.
+    late = []
+    assert asyncio.run(runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="BAF-skill MESSAGE FROM AGENT TS8\nlate\n",
+        plugin_id="peer-plugin", delivery="peer", delivery_id="live-2",
+        on_delivery=late.append)) in (True, False)
+    assert not any(event.get("effective") == "peer" for event in late)
