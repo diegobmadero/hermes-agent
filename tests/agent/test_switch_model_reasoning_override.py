@@ -13,6 +13,12 @@ from unittest.mock import MagicMock, patch
 class TestSwitchModelReasoningOverride:
     """Test switch_model re-resolves reasoning_config on model switch."""
 
+    @pytest.fixture(autouse=True)
+    def _offline_anthropic_client(self):
+        # These tests assert runtime state, not provider SDK construction.
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
+            yield
+
     def _make_fake_agent(self, model="gpt-5", provider="openai"):
         """Create a minimal fake agent for switch_model testing."""
         agent = MagicMock()
