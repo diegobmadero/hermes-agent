@@ -3815,6 +3815,10 @@ class _StreamingCall(StreamingWaitMonitor):
         return True
 
     def _call_wire(self, stream_attempt_id: int):
+        if self.agent._interrupt_requested:
+            raise InterruptedError("Agent interrupted before stream dispatch")
+        if self.on_dispatch is not None:
+            self.on_dispatch(self.api_kwargs)
         if self.agent.api_mode != "anthropic_messages":
             return self._call_chat_completions(stream_attempt_id)
         # Per-request client so the watchdog aborts its socket, not the shared one.
@@ -3839,8 +3843,6 @@ class _StreamingCall(StreamingWaitMonitor):
                     self._cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
                 try:
-                    if self.on_dispatch is not None:
-                        self.on_dispatch(self.api_kwargs)
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
