@@ -34,7 +34,9 @@ async def test_busy_peer_uses_bound_agent_without_a_gateway_wake():
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = object.__new__(GatewayRunner)
     runner._running, runner._draining = True, False
-    runner._async_session_store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=entry))
+    runner.session_store = SimpleNamespace()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry))
     runner.adapters, runner._profile_adapters = {Platform.TELEGRAM: adapter}, {}
     runner._is_user_authorized = MagicMock(return_value=True)
     runner._session_state = lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent))
@@ -52,3 +54,21 @@ async def test_busy_peer_uses_bound_agent_without_a_gateway_wake():
     adapter.handle_message.assert_not_awaited()
     assert events[0]["effective"] == "peer"
     assert events[0]["delivery_id"] == "id-1"
+
+    # A same-process plugin reload can submit the same ID again. The gateway owns
+    # the ledger, so the replacement context cannot insert or wake a second time.
+    assert await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="peer answer", plugin_id="peer-test",
+        delivery="peer", delivery_id="id-1", on_delivery=events.append,
+    )
+    agent.queue_peer_notification.assert_called_once()
+    adapter.handle_message.assert_not_awaited()
+
+    bound = agent.queue_peer_notification.call_args.kwargs
+    runner._schedule_plugin_message_injection = MagicMock(return_value=True)
+    runner._is_session_run_current = lambda key, generation: False  # /stop or /new fence
+    assert bound["valid"]() is False
+    bound["on_fallback"]("turn_changed")
+    assert runner._schedule_plugin_message_injection.call_args.kwargs["bound_session_id"] == "session-42"
+    assert events[-1]["effective"] == "queue"
+    assert events[-1]["reason"] == "turn_changed"

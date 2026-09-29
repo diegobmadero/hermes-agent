@@ -1851,6 +1851,8 @@ class GatewayInboundMixin:
 
     def _schedule_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, on_result=None,
+        delivery: str = "queue", delivery_id: str | None = None, on_delivery=None,
+        bound_session_id: str | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1860,6 +1862,8 @@ class GatewayInboundMixin:
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key, content=content, plugin_id=plugin_id,
+            delivery=delivery, delivery_id=delivery_id, on_delivery=on_delivery,
+            bound_session_id=bound_session_id,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -1907,7 +1911,9 @@ class GatewayInboundMixin:
         return True
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        delivery: str = "queue", delivery_id: str | None = None, on_delivery=None,
+        bound_session_id: str | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1916,7 +1922,8 @@ class GatewayInboundMixin:
         if not _accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
-        if entry is None or entry.origin is None or not _accepting():
+        if (entry is None or entry.origin is None or not _accepting()
+                or (bound_session_id is not None and entry.session_id != bound_session_id)):
             return False
 
         from gateway.session_identity import replace_source
@@ -1939,6 +1946,75 @@ class GatewayInboundMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
             return False
+        queue_reason = "requested_queue"
+        peer_key = None
+
+        def report(effective: str, reason: str = "") -> None:
+            if on_delivery is None:
+                return
+            event = {"event": "routed", "delivery_id": delivery_id,
+                     "session_key": session_key, "session_id": entry.session_id,
+                     "effective": effective}
+            if reason:
+                event["reason"] = reason
+            try:
+                on_delivery(event)
+            except Exception:
+                logger.warning("Plugin delivery callback failed", exc_info=True)
+
+        if delivery == "peer":
+            ledger = getattr(self, "_peer_delivery_ledger", None)
+            if ledger is None:
+                ledger = self._peer_delivery_ledger = {}
+            key = (session_key, entry.session_id, plugin_id, delivery_id)
+            peer_key = key
+            prior = ledger.get(key)
+            if prior is not None:
+                report(prior)
+                return True
+            state = self._session_state(session_key)
+            agent = state.turn.agent
+            generation = self._current_session_run_generation(session_key)
+            turn_id = getattr(agent, "_inflight_turn_id", None)
+            can_peer = (
+                turn_id and getattr(agent, "session_id", None) == entry.session_id
+                and getattr(agent, "api_mode", None) != "codex_app_server"
+                and callable(getattr(agent, "queue_peer_notification", None))
+                and not getattr(agent, "_interrupt_requested", False)
+            )
+            if can_peer:
+                def valid():
+                    return (self._is_session_run_current(session_key, generation)
+                            and self._session_state(session_key).turn.agent is agent
+                            and getattr(agent, "session_id", None) == entry.session_id
+                            and getattr(agent, "_inflight_turn_id", None) == turn_id
+                            and not getattr(agent, "_interrupt_requested", False))
+
+                def fallback(reason):
+                    # The agent finalizer owns the pending record; this callback only queues
+                    # its one remaining delivery, scoped to the original session id.
+                    ledger[key] = "queue"
+                    report("queue", reason)
+                    self._schedule_plugin_message_injection(
+                        session_key=session_key, content=content, plugin_id=plugin_id,
+                        bound_session_id=entry.session_id,
+                    )
+
+                def included(event):
+                    if on_delivery is not None:
+                        try:
+                            on_delivery(event)
+                        except Exception:
+                            logger.warning("Plugin delivery callback failed", exc_info=True)
+
+                if agent.queue_peer_notification(
+                    content, plugin_id, delivery_id, valid=valid,
+                    on_included=included, on_fallback=fallback,
+                ):
+                    ledger[key] = "peer"
+                    report("peer")
+                    return True
+            queue_reason = "no_live_peer_turn"
 
         event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
@@ -1958,6 +2034,10 @@ class GatewayInboundMixin:
                 plugin_id, session_key,
             )
             return False
+        if peer_key is not None:
+            ledger[peer_key] = "queue"
+        if on_delivery is not None:
+            report("queue", queue_reason)
         logger.info(
             "Plugin message injection admitted: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,

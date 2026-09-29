@@ -534,6 +534,11 @@ _CONTROL_STATE: Dict[str, Any] = {
     # batch — no interrupt, no new user turn (role alternation preserved).
     "_pending_steer": None,
     "_pending_steer_lock": threading.Lock,
+    "_pending_peer": list,
+    "_pending_peer_lock": threading.Lock,
+    "_peer_seen": set,
+    "_peer_inserted": list,
+    "_peer_turn_closed": False,
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.
     "_pending_redirect": None,

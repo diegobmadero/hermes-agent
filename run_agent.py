@@ -140,6 +140,7 @@ from agent.status_output import StatusOutputMixin
 from agent.api_request_hooks import ApiRequestHooksMixin
 from agent.api_error_summary import ApiErrorSummaryMixin, is_provider_stream_parse_error
 from agent.interrupt_control import InterruptControlMixin
+from agent.peer_notification import PeerNotificationMixin
 from agent.turn_explainers import TurnExplainersMixin
 from agent.activity_tracking import ActivityTrackingMixin
 from agent.rate_limit_credits import RateLimitCreditsMixin
@@ -240,7 +241,7 @@ class _StreamErrorEvent(Exception):
 
 class AIAgent(
     ClientLifecycleMixin, StreamDeliveryMixin, StatusOutputMixin, ApiRequestHooksMixin, ApiErrorSummaryMixin,
-    InterruptControlMixin, TurnExplainersMixin, ActivityTrackingMixin, RateLimitCreditsMixin,
+    InterruptControlMixin, PeerNotificationMixin, TurnExplainersMixin, ActivityTrackingMixin, RateLimitCreditsMixin,
     SessionPersistenceMixin, CompressionFacadeMixin, TurnFacadeMixin, VisionMessagePrepMixin, ReasoningParamsMixin,
 ):
     """AI Agent with tool calling capabilities."""

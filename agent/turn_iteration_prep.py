@@ -153,6 +153,7 @@ def prepare_iteration(
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer:
         _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+    agent._insert_pending_peer(messages)
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -221,6 +222,12 @@ def prepare_iteration(
                     current_turn_user_idx, _reanchored_idx, agent.session_id or "-",
                 )
                 current_turn_user_idx = _reanchored_idx
+    # A peer row must be durable before any request can carry it. Tool results may have
+    # flushed earlier, but this new row has not; failed persistence must stop the call.
+    if any(not row.get("_db_persisted") for row, _ in getattr(agent, "_peer_inserted", ())
+           if row in messages):
+        if agent._flush_messages_to_session_db(messages) is not True:
+            raise RuntimeError("peer notification persistence failed before model request")
     # Mid-turn compaction (post-tool gate, overflow restart, recovery) rebuilds ``messages`` without
     # handing back a new index. A stale index splits the request's replay prefix inside this turn's
     # tool rows: prefix canonicalization then drops the assistant tool_call whose result fell past the
