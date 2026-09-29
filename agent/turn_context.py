@@ -553,6 +553,8 @@ def _bind_turn_identity(
     )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    agent._peer_turn_closed = False
+    agent._peer_inserted = []
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.

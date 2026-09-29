@@ -130,6 +130,8 @@ def perform_api_call(
         if _model_request_active is not None:
             _model_request_active.set()
     try:
+        from agent.peer_notification import emit_included_peer_receipts
+        emit_included_peer_receipts(agent, api_kwargs, turn_id=turn_id, request_id=api_request_id)
         response = run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
             task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,

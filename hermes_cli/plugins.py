@@ -604,6 +604,8 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         on_result: Callable[[bool | None], None] | None = None,
+        delivery: str = "queue", delivery_id: str | None = None,
+        on_delivery: Callable[[dict], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -616,6 +618,10 @@ class PluginContext:
         None = unknown/untracked (including CLI/TUI). It may run on another thread;
         keep it bounded. Never replay on None or infer model completion from True.
         """
+        if delivery not in {"queue", "peer"}:
+            raise ValueError("delivery must be 'queue' or 'peer'")
+        if delivery == "peer" and (not isinstance(delivery_id, str) or not delivery_id):
+            raise ValueError("peer delivery requires a nonempty delivery_id")
         reported = False
         report_lock = threading.Lock()
 
@@ -633,9 +639,19 @@ class PluginContext:
 
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
+        def queue_receipt(reason):
+            if on_delivery is not None:
+                try:
+                    on_delivery({"event": "routed", "delivery_id": delivery_id,
+                                 "session_key": session_key, "effective": "queue", "reason": reason})
+                except Exception:
+                    logger.warning("Plugin delivery callback failed", exc_info=True)
+
         if cli is not None:
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
+            if delivery == "peer":
+                queue_receipt("host_has_no_peer_path")
             report(None)
             return True
         if not session_key:
@@ -657,6 +673,8 @@ class PluginContext:
                 if self._manager.inject_tui_message(
                     session_key=session_key, content=msg, plugin_id=self.plugin_id,
                 ):
+                    if delivery == "peer":
+                        queue_receipt("host_has_no_peer_path")
                     report(None)
                     return True
             except Exception:
@@ -669,9 +687,18 @@ class PluginContext:
             report(False)
             return False
         try:
+            peer_allowed = (delivery == "peer" and self._midturn_injection_allowed()
+                            and self._manager.supports_gateway_peer)
+            if delivery == "peer" and not peer_allowed:
+                queue_receipt("permission_off" if not self._midturn_injection_allowed()
+                              else "host_has_no_peer_path")
             scheduled = bool(self._manager.inject_gateway_message(
                 session_key=session_key, content=msg, plugin_id=self.plugin_id,
                 **({"on_result": report} if on_result is not None else {}),
+                **({"delivery": "peer", "delivery_id": delivery_id, "on_delivery": on_delivery}
+                   if peer_allowed else
+                   {"delivery_id": delivery_id, "on_delivery": on_delivery}
+                   if delivery == "queue" and self._manager.supports_gateway_peer else {}),
             ))
             if not scheduled:
                 report(False)
@@ -689,6 +716,14 @@ class PluginContext:
         except Exception:
             return False
         return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
+
+    def _midturn_injection_allowed(self) -> bool:
+        try:
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config_readonly() or {}
+        except Exception:
+            return False
+        return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_midturn_injection") is True
 
     @_serialized_replacement
     def register_cli_command(
@@ -1339,6 +1374,17 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def has_gateway_message_injector(self) -> bool:
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
+
+    @property
+    def supports_gateway_peer(self) -> bool:
+        registered = self._gateway_message_injector
+        if registered is None:
+            return False
+        try:
+            params = inspect.signature(registered[1]).parameters
+        except (TypeError, ValueError):
+            return False
+        return {"delivery", "delivery_id", "on_delivery"} <= params.keys()
 
     def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
         """Publish a live gateway injector and its lifecycle owner."""
