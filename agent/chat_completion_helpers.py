@@ -758,7 +758,7 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     return finish(raw_response)
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client, on_dispatch=None):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by ``interruptible_api_call`` and ``direct_api_call``. ``make_client(reason,
@@ -766,6 +766,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    if agent._interrupt_requested:
+        raise InterruptedError("Agent interrupted before API request dispatch")
+    if on_dispatch is not None:
+        on_dispatch(api_kwargs)
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -1011,7 +1015,7 @@ class _InlineRequest:
         return client
 
 
-def direct_api_call(agent, api_kwargs: dict):
+def direct_api_call(agent, api_kwargs: dict, *, on_dispatch=None):
     """Run a non-streaming LLM call inline on the conversation thread (cron turns,
     delegated children — see ``should_use_direct_api_call``): no interrupt worker,
     so the nested-pool deadlock cannot occur. An activity heartbeat keeps
@@ -1038,7 +1042,8 @@ def direct_api_call(agent, api_kwargs: dict):
     # close the client so the retry builds a fresh pool.
     succeeded = False
     try:
-        response = _dispatch_nonstreaming_api_request(agent, api_kwargs, make_client=request.make_client)
+        response = _dispatch_nonstreaming_api_request(
+            agent, api_kwargs, make_client=request.make_client, on_dispatch=on_dispatch)
     except Exception:
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
@@ -1290,7 +1295,7 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent, api_kwargs: dict, *, on_dispatch=None):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
@@ -1299,11 +1304,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        return direct_api_call(agent, api_kwargs, on_dispatch=on_dispatch)
     _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
     from agent.chat_completion_nonstream import _NonStreamRequest
 
-    return _NonStreamRequest(agent, api_kwargs).run()
+    return _NonStreamRequest(agent, api_kwargs, on_dispatch=on_dispatch).run()
 
 
 def _consume_ephemeral_reasoning_off(agent) -> bool:
@@ -2601,13 +2606,14 @@ def _with_stream_emitters(agent, run):
     return response
 
 
-def _stream_codex_passthrough(agent, api_kwargs: dict, on_first_delta):
+def _stream_codex_passthrough(agent, api_kwargs: dict, on_first_delta, on_dispatch=None):
     """Codex streams internally via _run_codex_stream (reached through
     _interruptible_api_call); park ``on_first_delta`` on the agent so it can pick
     it up, and bracket the call with the stream start/end emitters."""
     agent._codex_on_first_delta = on_first_delta
     try:
-        return _with_stream_emitters(agent, lambda: agent._interruptible_api_call(api_kwargs))
+        return _with_stream_emitters(
+            agent, lambda: agent._interruptible_api_call(api_kwargs, on_dispatch=on_dispatch))
     finally:
         agent._codex_on_first_delta = None
 
@@ -2627,10 +2633,11 @@ class _BedrockStream:
     with real-time delta callbacks, polled by an interrupt / stale-event watchdog
     (same UX as the Anthropic and chat_completions streams)."""
 
-    def __init__(self, agent, api_kwargs: dict, on_first_delta):
+    def __init__(self, agent, api_kwargs: dict, on_first_delta, on_dispatch=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
         self.on_first_delta = on_first_delta
+        self.on_dispatch = on_dispatch
         self.result = {"response": None, "error": None}
         self.first_delta_fired = False
         self.response_started = False
@@ -2680,6 +2687,10 @@ class _BedrockStream:
         agent = self.agent
         stream = None
         try:
+            if agent._interrupt_requested:
+                raise InterruptedError("Agent interrupted before Bedrock request dispatch")
+            if self.on_dispatch is not None:
+                self.on_dispatch(self.api_kwargs)
             from agent import relay_llm
             from agent.bedrock_adapter import stream_converse_with_callbacks
             intercepted_events = []
@@ -2860,10 +2871,11 @@ class _StreamingCall(StreamingWaitMonitor):
     State shared between the request worker and the poll-loop monitor (heartbeat,
     stale kill, interrupt abort) lives on the instance, mutated from both threads."""
 
-    def __init__(self, agent, api_kwargs: dict, on_first_delta):
+    def __init__(self, agent, api_kwargs: dict, on_first_delta, on_dispatch=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
         self.on_first_delta = on_first_delta
+        self.on_dispatch = on_dispatch
         self.worker = None  # request thread; None in inline mode
         self.result = {"response": None, "error": None, "partial_tool_names": []}
         self.clients = _RequestClientRegistry(agent)
@@ -3827,6 +3839,8 @@ class _StreamingCall(StreamingWaitMonitor):
                     self._cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
                 try:
+                    if self.on_dispatch is not None:
+                        self.on_dispatch(self.api_kwargs)
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
@@ -4073,7 +4087,8 @@ class _StreamingCall(StreamingWaitMonitor):
         return self.result["response"]
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None,
+                                     on_dispatch=None):
     """Streaming variant of _interruptible_api_call: fires the delta callbacks per
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
@@ -4081,12 +4096,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":
-        return _stream_codex_passthrough(agent, api_kwargs, on_first_delta)
+        return _stream_codex_passthrough(agent, api_kwargs, on_first_delta, on_dispatch)
     if agent.api_mode == "bedrock_converse":
-        return _BedrockStream(agent, api_kwargs, on_first_delta).run()
+        return _BedrockStream(agent, api_kwargs, on_first_delta, on_dispatch).run()
     # Cross-turn stale-stream circuit breaker (see ``_stale_streak()``).
     _check_stale_giveup(agent)
-    return _StreamingCall(agent, api_kwargs, on_first_delta).run()
+    return _StreamingCall(agent, api_kwargs, on_first_delta, on_dispatch).run()
 
 
 __all__ = ["interruptible_api_call", "build_api_kwargs", "build_assistant_message", "try_activate_fallback",

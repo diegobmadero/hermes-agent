@@ -86,6 +86,10 @@ def perform_api_call(
 
     _use_streaming = _should_stream(agent)
 
+    def included_on_dispatch(next_kwargs):
+        from agent.peer_notification import emit_included_peer_receipts
+        emit_included_peer_receipts(agent, next_kwargs, turn_id=turn_id, request_id=api_request_id)
+
     def _perform_api_call(next_api_kwargs):
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -93,16 +97,17 @@ def perform_api_call(
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
         if _use_streaming:
-            from agent.peer_notification import emit_included_peer_receipts
-            emit_included_peer_receipts(agent, next_api_kwargs, turn_id=turn_id, request_id=api_request_id)
+            if getattr(agent, "_peer_inserted", None):
+                return agent._interruptible_streaming_api_call(
+                    next_api_kwargs, on_first_delta=_stop_spinner, on_dispatch=included_on_dispatch,
+                )
             return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
-            )
+                next_api_kwargs, on_first_delta=_stop_spinner)
         from agent import relay_llm
 
         def dispatch(next_kwargs):
-            from agent.peer_notification import emit_included_peer_receipts
-            emit_included_peer_receipts(agent, next_kwargs, turn_id=turn_id, request_id=api_request_id)
+            if getattr(agent, "_peer_inserted", None):
+                return agent._interruptible_api_call(next_kwargs, on_dispatch=included_on_dispatch)
             return agent._interruptible_api_call(next_kwargs)
 
         return relay_llm.execute(

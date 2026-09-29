@@ -1,9 +1,14 @@
 """A peer notice joins the running turn at a durable, role-safe request boundary."""
 
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from agent.peer_notification import emit_included_peer_receipts, peer_user_row
 from agent.prompt_builder import STEER_MARKER_OPEN
+from agent.turn_api_call import perform_api_call
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tests.agent.test_run_agent import _mock_response, _mock_tool_call
@@ -168,3 +173,74 @@ def test_persisted_unincluded_peer_is_not_queued_a_second_time():
     agent._fallback_pending_peer()
     assert fallback == []
     assert messages[-1]["display_kind"] == "peer_notification"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cancelled_preflight_never_reports_peer_inclusion(streaming):
+    receipts = []
+    row = peer_user_row({"content": "peer answer\n", "plugin_id": "peer-plugin",
+                         "delivery_id": "delivery-1"})
+    row["_db_persisted"] = True
+    notice = {"delivery_id": "delivery-1", "on_included": receipts.append}
+    agent = MagicMock()
+    agent.session_id = "peer-session"
+    agent.api_mode = "chat_completions"
+    agent._interrupt_requested = True
+    agent._peer_inserted = [(row, notice)]
+    agent._model_request_active = threading.Event()
+    agent._pending_redirect_lock = None
+    agent._pending_redirect = None
+    agent.provider = "openai"
+    agent.model = "test-model"
+    agent.base_url = "https://example.invalid"
+
+    def cancelled(*args, **kwargs):
+        raise InterruptedError("cancelled before provider dispatch")
+
+    agent._interruptible_streaming_api_call.side_effect = cancelled
+    agent._interruptible_api_call.side_effect = cancelled
+    request = {"messages": [{"role": "user", "content": row["content"].rstrip("\n")}]}
+    with (patch("agent.turn_api_call._should_stream", return_value=streaming),
+          patch("hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=lambda kwargs, perform, **unused: perform(kwargs)),
+          patch("agent.relay_llm.execute", side_effect=lambda kwargs, dispatch, **unused: dispatch(kwargs))):
+        with pytest.raises(InterruptedError):
+            perform_api_call(
+                agent, api_kwargs=request, _original_api_kwargs=request,
+                _llm_middleware_trace=[], _moa_prepared_request=None, _retry=SimpleNamespace(),
+                thinking_spinner=None, retry_count=0, api_call_count=1,
+                api_request_id="request-1", effective_task_id="task-1", turn_id="turn-1",
+                interrupted=False,
+            )
+    assert receipts == []
+
+
+def test_streaming_dispatch_reports_persisted_peer_once_after_gate():
+    from tests.agent.test_streaming import _make_stream_chunk
+
+    row = peer_user_row({"content": "peer answer\n", "plugin_id": "peer-plugin",
+                         "delivery_id": "delivery-stream"})
+    row["_db_persisted"] = True
+    receipts = []
+    with (patch("agent.process_bootstrap.OpenAI"),
+          patch("run_agent.AIAgent._create_request_openai_client") as create_client,
+          patch("run_agent.AIAgent._close_request_openai_client")):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([
+            _make_stream_chunk(content="done", finish_reason="stop", model="test-model")])
+        create_client.return_value = client
+        agent.api_mode = "chat_completions"
+        agent.session_id = "peer-session"
+        agent._interrupt_requested = False
+        agent._peer_inserted = [(row, {"delivery_id": "delivery-stream",
+                                       "on_included": receipts.append})]
+        kwargs = {"model": "test-model", "messages": [{"role": "user",
+                                                        "content": row["content"].rstrip("\n")}],
+                  "stream": True}
+        agent._interruptible_streaming_api_call(
+            kwargs, on_dispatch=lambda wire: emit_included_peer_receipts(
+                agent, wire, turn_id="turn-1", request_id="request-1"))
+    assert [(event["delivery_id"], event["request_id"]) for event in receipts] == [
+        ("delivery-stream", "request-1")]
