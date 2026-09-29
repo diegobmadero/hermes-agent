@@ -265,3 +265,52 @@ def test_streaming_dispatch_reports_persisted_peer_once_after_gate():
                 agent, wire, turn_id="turn-1", request_id="request-1"))
     assert [(event["delivery_id"], event["request_id"]) for event in receipts] == [
         ("delivery-stream", "request-1")]
+
+
+def test_human_steer_takes_shared_tool_boundary_and_peer_falls_back_once():
+    entered.clear()
+    release.clear()
+    schema = {"type": "function", "function": {"name": TOOL, "description": "probe",
+              "parameters": {"type": "object", "properties": {}, "required": []}}}
+    with (patch("model_tools.get_tool_definitions", return_value=[schema]),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI")):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    captured = []
+
+    def provider(**kwargs):
+        captured.append(kwargs["messages"])
+        return (_mock_response(content="", finish_reason="tool_calls",
+                               tool_calls=[_mock_tool_call(name=TOOL)]) if len(captured) == 1
+                else _mock_response(content="original task continued", finish_reason="stop"))
+
+    agent.client.chat.completions.create.side_effect = provider
+    fallbacks = []
+    outcome = {}
+    with (patch.object(agent, "_persist_session"),
+          patch.object(agent, "_cleanup_task_resources")):
+        worker = threading.Thread(target=lambda: outcome.setdefault(
+            "result", agent.run_conversation("original task")))
+        worker.start()
+        try:
+            assert entered.wait(5)
+            assert agent.steer("human correction")
+            assert agent.queue_peer_notification("peer answer", "peer-plugin", "delivery-steer",
+                                                 on_fallback=fallbacks.append)
+        finally:
+            release.set()
+            worker.join(10)
+    assert not worker.is_alive()
+    assert len(captured) == 2
+    assert [row["role"] for row in captured[1]][-2:] == ["tool", "user"]
+    assert sum(STEER_MARKER_OPEN in str(row.get("content")) for row in captured[1]) == 1
+    assert all("peer answer" not in str(row.get("content")) for row in captured[1])
+    assert all(row.get("display_kind") != "peer_notification" for row in outcome["result"]["messages"])
+    assert fallbacks == ["turn_ended"]

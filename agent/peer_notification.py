@@ -43,6 +43,8 @@ class PeerNotificationMixin:
     def _insert_pending_peer(self, messages):
         """Insert at most one notice after the newest tool result at a safe boundary."""
         lock = getattr(self, "_pending_peer_lock", None)
+        # Human steer owns a boundary it already filled with a user row. Keep peer
+        # provenance separate and defer it; two adjacent user rows break alternation.
         if lock is None or not messages or messages[-1].get("role") != "tool":
             return False
         with lock:
