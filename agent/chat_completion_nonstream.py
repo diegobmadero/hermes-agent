@@ -11,9 +11,10 @@ class _NonStreamRequest:
     instance; ``_abort_request`` may run from the poll (stranger) thread.
     """
 
-    def __init__(self, agent, api_kwargs: dict):
+    def __init__(self, agent, api_kwargs: dict, *, on_dispatch=None):
         self.agent = agent
         self.api_kwargs = api_kwargs
+        self.on_dispatch = on_dispatch
         self.result = {"response": None, "error": None}
         self.clients = h._RequestClientRegistry(agent)
         # Request-local cancel flag: agent._interrupt_requested is cleared at turn
@@ -74,7 +75,8 @@ class _NonStreamRequest:
                 watchdog_state_var = _codex_watchdog_state_var
                 watchdog_context_token = watchdog_state_var.set(self.codex_watchdog_state)
             self.result["response"] = h._dispatch_nonstreaming_api_request(
-                self.agent, self.api_kwargs, make_client=self._make_client)
+                self.agent, self.api_kwargs, make_client=self._make_client,
+                on_dispatch=self.on_dispatch)
         except Exception as e:
             # Our own force-close caused this error: swallow it, the main
             # thread raises InterruptedError (#6600). Retirement logs at info
