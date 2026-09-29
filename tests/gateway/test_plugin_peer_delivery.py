@@ -56,7 +56,7 @@ async def test_busy_peer_uses_bound_agent_without_a_gateway_wake():
     entry = SessionEntry(session_key="agent:main:telegram:dm:42", session_id="session-42",
                          created_at=datetime.now(), updated_at=datetime.now(),
                          origin=source, platform=Platform.TELEGRAM)
-    agent = SimpleNamespace(session_id=entry.session_id, _inflight_turn_id="turn-1",
+    agent = SimpleNamespace(session_id=entry.session_id, _current_turn_id="turn-1", _peer_turn_closed=False,
                             queue_peer_notification=MagicMock(return_value=True))
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = object.__new__(GatewayRunner)
@@ -173,7 +173,7 @@ async def test_removed_bound_route_retains_peer_without_claiming_queue(fallback_
                             origin=source, platform=Platform.TELEGRAM)
 
     lookup = AsyncMock(return_value=entry("old"))
-    agent = SimpleNamespace(session_id="old", _inflight_turn_id="turn-1",
+    agent = SimpleNamespace(session_id="old", _current_turn_id="turn-1", _peer_turn_closed=False,
                             queue_peer_notification=MagicMock(return_value=True))
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = object.__new__(GatewayRunner)
@@ -225,7 +225,7 @@ async def test_finalizer_fallback_before_append_returns_cannot_be_overwritten_by
     def append_then_finalize(*args, **kwargs):
         kwargs["on_fallback"]("turn_ended")
         return True
-    agent = SimpleNamespace(session_id="old", _inflight_turn_id="turn-1",
+    agent = SimpleNamespace(session_id="old", _current_turn_id="turn-1", _peer_turn_closed=False,
                             queue_peer_notification=append_then_finalize)
     runner = object.__new__(GatewayRunner)
     runner._running, runner._draining = True, False
@@ -328,7 +328,7 @@ async def test_many_peer_delivery_ids_reuse_bounded_route_synchronization():
     key = "agent:main:telegram:dm:42"
     entry = SessionEntry(session_key=key, session_id="session-42", created_at=datetime.now(),
                          updated_at=datetime.now(), origin=source, platform=Platform.TELEGRAM)
-    agent = SimpleNamespace(session_id="session-42", _inflight_turn_id="turn-1",
+    agent = SimpleNamespace(session_id="session-42", _current_turn_id="turn-1", _peer_turn_closed=False,
                             queue_peer_notification=MagicMock(return_value=True))
     runner = object.__new__(GatewayRunner)
     runner._running, runner._draining = True, False
