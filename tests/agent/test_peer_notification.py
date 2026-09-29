@@ -215,6 +215,27 @@ def test_cancelled_preflight_never_reports_peer_inclusion(streaming):
     assert receipts == []
 
 
+def test_equal_content_peer_rows_consume_distinct_wire_items_once():
+    receipts = []
+    agent = object.__new__(AIAgent)
+    agent.session_id = "peer-session"
+    agent._peer_inserted = []
+    for delivery_id in ("delivery-1", "delivery-2"):
+        row = peer_user_row({"content": "same payload\n", "plugin_id": "peer-plugin",
+                             "delivery_id": delivery_id})
+        row["_db_persisted"] = True
+        agent._peer_inserted.append((row, {"delivery_id": delivery_id,
+                                           "on_included": receipts.append}))
+    wire = {"messages": [{"role": "user", "content": agent._peer_inserted[0][0]["content"].rstrip("\n")}]}
+    emit_included_peer_receipts(agent, wire, turn_id="turn-1", request_id="request-1")
+    assert [event["delivery_id"] for event in receipts] == ["delivery-1"]
+    emit_included_peer_receipts(agent, wire, turn_id="turn-1", request_id="request-2")
+    assert [event["delivery_id"] for event in receipts] == ["delivery-1"]
+    both = {"messages": [wire["messages"][0], dict(wire["messages"][0])]}
+    emit_included_peer_receipts(agent, both, turn_id="turn-1", request_id="request-3")
+    assert [event["delivery_id"] for event in receipts] == ["delivery-1", "delivery-2"]
+
+
 def test_streaming_dispatch_reports_persisted_peer_once_after_gate():
     from tests.agent.test_streaming import _make_stream_chunk
 
