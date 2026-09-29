@@ -1988,11 +1988,12 @@ class GatewayInboundMixin:
             route_lock = route_locks.setdefault(key, threading.RLock())
             with route_lock:
                 prior = ledger.get(key)
-                if prior is not None:
-                    if prior in {"peer", "queue"}:
-                        report(prior)
-                    return True
-                ledger[key] = "pending"
+                if prior is None:
+                    ledger[key] = "pending"
+            if prior is not None:
+                if prior in {"peer", "queue"}:
+                    report(prior)
+                return True
             state = self._session_state(session_key)
             agent = state.turn.agent
             generation = self._current_session_run_generation(session_key)
@@ -2023,19 +2024,21 @@ class GatewayInboundMixin:
 
                     def queue_result(outcome):
                         with route_lock:
-                            if ledger[key] != "queue_pending":
+                            if ledger.get(key) != "queue_pending":
                                 return
                             if outcome is True:
                                 ledger[key] = "queue"
-                                report("queue", reason)
                             else:
                                 ledger[key] = "retained"
-                                logger.warning(
-                                    "Peer fallback queue admission %s; retaining delivery: "
-                                    "plugin=%s session=%s delivery_id=%s",
-                                    "refused" if outcome is False else "unknown",
-                                    plugin_id, session_key, delivery_id,
-                                )
+                        if outcome is True:
+                            report("queue", reason)
+                        else:
+                            logger.warning(
+                                "Peer fallback queue admission %s; retaining delivery: "
+                                "plugin=%s session=%s delivery_id=%s",
+                                "refused" if outcome is False else "unknown",
+                                plugin_id, session_key, delivery_id,
+                            )
 
                     scheduled = self._schedule_plugin_message_injection(
                         session_key=session_key, content=content, plugin_id=plugin_id,
@@ -2057,13 +2060,14 @@ class GatewayInboundMixin:
                 ):
                     with route_lock:
                         # Finalization may have claimed fallback before append returned.
-                        if ledger[key] == "pending":
+                        claimed = ledger.get(key) == "pending"
+                        if claimed:
                             ledger[key] = "peer"
-                            report("peer")
+                    if claimed:
+                        report("peer")
                     return True
             with route_lock:
-                ledger.pop(key, None)
-                route_locks.pop(key, None)
+                ledger[key] = "queue_pending"
             queue_reason = "no_live_peer_turn"
 
         event = MessageEvent(
@@ -2079,13 +2083,30 @@ class GatewayInboundMixin:
         try:
             await admit_internal_event(adapter, event)
         except WakeNotAccepted:
+            if peer_key is not None:
+                with route_lock:
+                    if ledger.get(peer_key) == "queue_pending":
+                        ledger.pop(peer_key, None)
             logger.warning(
                 "Plugin message injection not admitted: plugin=%s session=%s",
                 plugin_id, session_key,
             )
             return False
+        except BaseException:
+            if peer_key is not None:
+                with route_lock:
+                    if ledger.get(peer_key) == "queue_pending":
+                        ledger[peer_key] = "retained"
+                logger.warning(
+                    "Plugin message injection admission unknown; retaining delivery: "
+                    "plugin=%s session=%s delivery_id=%s",
+                    plugin_id, session_key, delivery_id, exc_info=True,
+                )
+            raise
         if peer_key is not None:
-            ledger[peer_key] = "queue"
+            with route_lock:
+                if ledger.get(peer_key) == "queue_pending":
+                    ledger[peer_key] = "queue"
         if on_delivery is not None:
             report("queue", queue_reason)
         logger.info(
