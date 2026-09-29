@@ -695,7 +695,8 @@ class PluginContext:
             scheduled = bool(self._manager.inject_gateway_message(
                 session_key=session_key, content=msg, plugin_id=self.plugin_id,
                 **({"on_result": report} if on_result is not None else {}),
-                **({"delivery": "peer", "delivery_id": delivery_id, "on_delivery": on_delivery}
+                **({"delivery": "peer", "delivery_id": delivery_id, "on_delivery": on_delivery,
+                    "permission_check": self._midturn_injection_allowed}
                    if peer_allowed else
                    {"delivery_id": delivery_id, "on_delivery": on_delivery}
                    if delivery == "queue" and self._manager.supports_gateway_peer else {}),
@@ -1384,7 +1385,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             params = inspect.signature(registered[1]).parameters
         except (TypeError, ValueError):
             return False
-        return {"delivery", "delivery_id", "on_delivery"} <= params.keys()
+        return {"delivery", "delivery_id", "on_delivery", "permission_check"} <= params.keys()
 
     def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
         """Publish a live gateway injector and its lifecycle owner."""

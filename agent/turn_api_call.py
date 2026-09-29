@@ -93,14 +93,21 @@ def perform_api_call(
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
         if _use_streaming:
+            from agent.peer_notification import emit_included_peer_receipts
+            emit_included_peer_receipts(agent, next_api_kwargs, turn_id=turn_id, request_id=api_request_id)
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
         from agent import relay_llm
 
+        def dispatch(next_kwargs):
+            from agent.peer_notification import emit_included_peer_receipts
+            emit_included_peer_receipts(agent, next_kwargs, turn_id=turn_id, request_id=api_request_id)
+            return agent._interruptible_api_call(next_kwargs)
+
         return relay_llm.execute(
             next_api_kwargs,
-            agent._interruptible_api_call,
+            dispatch,
             session_id=str(agent.session_id or ""),
             name=str(agent.provider or "provider"),
             model_name=str(agent.model or ""),
@@ -130,8 +137,6 @@ def perform_api_call(
         if _model_request_active is not None:
             _model_request_active.set()
     try:
-        from agent.peer_notification import emit_included_peer_receipts
-        emit_included_peer_receipts(agent, api_kwargs, turn_id=turn_id, request_id=api_request_id)
         response = run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
             task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,

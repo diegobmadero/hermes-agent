@@ -1852,18 +1852,27 @@ class GatewayInboundMixin:
     def _schedule_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str, on_result=None,
         delivery: str = "queue", delivery_id: str | None = None, on_delivery=None,
-        bound_session_id: str | None = None,
+        bound_session_id: str | None = None, bound_generation: int | None = None,
+        permission_check=None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
+        if delivery == "peer":
+            # Snapshot ownership before hopping to the gateway loop. A /new between
+            # scheduling and dispatch must never attach this notice to the replacement.
+            bound_session_id = self.session_store.peek_session_id(session_key)
+            if not bound_session_id:
+                return False
+            bound_generation = self._current_session_run_generation(session_key)
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key, content=content, plugin_id=plugin_id,
             delivery=delivery, delivery_id=delivery_id, on_delivery=on_delivery,
-            bound_session_id=bound_session_id,
+            bound_session_id=bound_session_id, bound_generation=bound_generation,
+            permission_check=permission_check,
         )
         try:
             current_loop = asyncio.get_running_loop()
@@ -1913,7 +1922,8 @@ class GatewayInboundMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str,
         delivery: str = "queue", delivery_id: str | None = None, on_delivery=None,
-        bound_session_id: str | None = None,
+        bound_session_id: str | None = None, bound_generation: int | None = None,
+        permission_check=None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
@@ -1924,6 +1934,9 @@ class GatewayInboundMixin:
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if (entry is None or entry.origin is None or not _accepting()
                 or (bound_session_id is not None and entry.session_id != bound_session_id)):
+            return False
+        if (bound_generation is not None
+                and not self._is_session_run_current(session_key, bound_generation)):
             return False
 
         from gateway.session_identity import replace_source
@@ -1980,6 +1993,7 @@ class GatewayInboundMixin:
                 turn_id and getattr(agent, "session_id", None) == entry.session_id
                 and getattr(agent, "api_mode", None) != "codex_app_server"
                 and callable(getattr(agent, "queue_peer_notification", None))
+                and (permission_check is None or permission_check())
                 and not getattr(agent, "_interrupt_requested", False)
             )
             if can_peer:
@@ -1988,6 +2002,7 @@ class GatewayInboundMixin:
                             and self._session_state(session_key).turn.agent is agent
                             and getattr(agent, "session_id", None) == entry.session_id
                             and getattr(agent, "_inflight_turn_id", None) == turn_id
+                            and (permission_check is None or permission_check())
                             and not getattr(agent, "_interrupt_requested", False))
 
                 def fallback(reason):

@@ -67,8 +67,11 @@ class PeerNotificationMixin:
         with lock:
             self._peer_turn_closed = True
             pending, self._pending_peer = self._pending_peer, []
-        pending.extend(notice for _, notice in getattr(self, "_peer_inserted", ())
-                       if not notice.get("included") and not notice.get("fallen_back"))
+        # A persisted row can reappear in later history even if this attempt never
+        # started. Do not enqueue a second copy; the missing inclusion receipt stays
+        # uncertain for the plugin to reconcile by the exact persisted delivery ID.
+        pending.extend(notice for row, notice in getattr(self, "_peer_inserted", ())
+                       if not row.get("_db_persisted") and not notice.get("fallen_back"))
         for notice in pending:
             notice["fallen_back"] = True
             if notice["on_fallback"]:
@@ -83,8 +86,9 @@ def emit_included_peer_receipts(agent, api_kwargs, *, turn_id, request_id):
         return
     for row, notice in rows:
         # A middleware may have removed the row; an attempted request without it has no receipt.
+        # The request builder strips terminal newlines from copied message content.
         if not any(isinstance(item, dict) and item.get("role") == "user" and
-                   item.get("content") == row["content"] for item in wire):
+                   item.get("content") == row["content"].rstrip("\n") for item in wire):
             continue
         from agent.context_compressor import _DB_PERSISTED_MARKER
         if not row.get(_DB_PERSISTED_MARKER):
