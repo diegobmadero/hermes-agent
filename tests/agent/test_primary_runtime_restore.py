@@ -195,7 +195,7 @@ class TestRestorePrimaryRuntime:
         assert agent.reasoning_config == reasoning
         assert agent._reasoning_config_is_runtime_override is True
 
-        with patch("run_agent.OpenAI", return_value=MagicMock()):
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
 
         assert agent.reasoning_config == reasoning

@@ -86,9 +86,9 @@ def agent():
 
 def test_constructor_carries_runtime_reasoning_override_provenance():
     with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         runtime_agent = AIAgent(
             api_key="test-key-1234567890",
@@ -847,7 +847,7 @@ class TestBuildSystemPrompt:
                 return_value=_make_tool_defs("web_search", "reasoning_effort"),
             ),
             patch("model_tools.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             agent = AIAgent(
                 api_key="test-key-1234567890",
@@ -872,11 +872,11 @@ class TestBuildSystemPrompt:
         provider prefix caching (see agent/system_prompt.py)."""
         with (
             patch(
-                "run_agent.get_tool_definitions",
+                "model_tools.get_tool_definitions",
                 return_value=_make_tool_defs("web_search", "reasoning_effort"),
             ),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("run_agent.OpenAI"),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
         ):
             agent = AIAgent(
                 api_key="test-key-1234567890",

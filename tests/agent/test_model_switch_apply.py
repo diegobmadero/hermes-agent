@@ -41,9 +41,9 @@ def agent():
     from run_agent import AIAgent
 
     with (
-        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         a = AIAgent(
             api_key="test-key-1234567890",
