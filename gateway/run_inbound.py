@@ -595,6 +595,12 @@ class GatewayInboundMixin:
             _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
             _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
             if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+                # Compression publishes its child before the route is rebound. The
+                # ended parent still belongs to the live turn during that window.
+                _tip_lookup = getattr(_reap_store, "_compression_tip_for_session_id", None)
+                _tip = _tip_lookup(_reap_sid) if callable(_tip_lookup) else _reap_sid
+                if isinstance(_tip, str) and _tip and _tip != _reap_sid and _is_ended(_tip) is False:
+                    return
                 logger.warning(
                     "Evicting stale _running_agents entry for %s — "
                     "durable session %s is ended (reaped) in state.db; "
@@ -654,7 +660,7 @@ class GatewayInboundMixin:
 
     def _hm_busy_telegram_grace_queue(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, effective_busy_input_mode: str
-    ) -> bool:
+    ) -> tuple[bool, Optional[str]]:
         """Queue a Telegram text follow-up that lands within the post-start grace window."""
         _grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
         _grace_state = self._peek_session_state(_quick_key)
@@ -663,24 +669,25 @@ class GatewayInboundMixin:
             source.platform == Platform.TELEGRAM and event.message_type == MessageType.TEXT
             and _grace > 0 and _started_at and (time.time() - _started_at) <= _grace
         ):
-            return False
+            return False, None
         logger.debug(
             "Telegram follow-up arrived %.2fs after run start for %s — queueing without interrupt",
             time.time() - _started_at, _quick_key,
         )
-        if effective_busy_input_mode != "queue":
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
-        else:
-            adapter = self._delivery_adapter_for(source)
-            if adapter:
-                self._enqueue_fifo(_quick_key, event, adapter)
-        return True
+        adapter = self._delivery_adapter_for(source)
+        pending = getattr(adapter, "_pending_messages", {}).get(_quick_key)
+        if (effective_busy_input_mode == "queue" or event.internal
+                or getattr(pending, "internal", False) or not adapter):
+            return True, self._queue_pending_reply(_quick_key, event)
+        self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
+        event._gateway_accepted = True
+        return True, None
 
     @staticmethod
     def _hm_text_only(event: "MessageEvent") -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
+    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> Optional[str]:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
@@ -694,11 +701,11 @@ class GatewayInboundMixin:
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        return self._queue_pending_reply(_quick_key, event)
 
     async def _hm_busy_interrupt(
         self, event: "MessageEvent", source: SessionSource, running_agent: Any, _quick_key: str
-    ) -> None:
+    ) -> Optional[str]:
         """Interrupt path: redirect text-only corrections when supported, else ``agent.interrupt()``."""
         from gateway.run import _build_media_placeholder
         # Text-only corrections redirect the live turn (preserving displayed context) when the
@@ -717,9 +724,12 @@ class GatewayInboundMixin:
             )
         elif not _interrupt_text and getattr(event, "media_urls", None):
             _interrupt_text = _build_media_placeholder(event)
-        # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
-        # — that copy was never consumed and grew unbounded.
+        # Retain the original event before interrupting: the drain prefers a
+        # parked wake over interrupt_message, which otherwise loses this input.
+        if not self._queue_or_replace_pending_event(_quick_key, event):
+            return self._BUSY_QUEUE_REFUSAL
         running_agent.interrupt(_interrupt_text)
+        return None
 
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -727,13 +737,17 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if event.internal:
+            return self._queue_pending_reply(_quick_key, event)
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
-        if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
-            return None
+        grace_handled, grace_reply = self._hm_busy_telegram_grace_queue(
+            event, source, _quick_key, effective_busy_input_mode)
+        if grace_handled:
+            return grace_reply
 
         _ra_state = self._peek_session_state(_quick_key)
         running_agent = _ra_state.turn.agent if _ra_state else None
@@ -742,12 +756,11 @@ class GatewayInboundMixin:
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
-            return None
+            return self._queue_pending_reply(_quick_key, event)  # picked up after start
         if self._draining:
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
-            if queue_during_drain:
-                self._queue_or_replace_pending_event(_quick_key, event)
+            if queue_during_drain and not self._queue_or_replace_pending_event(_quick_key, event):
+                return self._BUSY_QUEUE_REFUSAL
             return (
                 t("gateway.busy.drain_queued", action=self._status_action_gerund())
                 if queue_during_drain
@@ -755,11 +768,9 @@ class GatewayInboundMixin:
             )
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-            self._queue_or_replace_pending_event(_quick_key, event)
-            return None
+            return self._queue_pending_reply(_quick_key, event)
         if effective_busy_input_mode == "steer":
-            self._hm_busy_steer(event, running_agent, _quick_key)
-            return None
+            return self._hm_busy_steer(event, running_agent, _quick_key)
         # Subagent protection: an interrupt cascades through ``_active_children`` and aborts
         # in-flight delegate_task work (/stop reached its handler above — still an escape hatch).
         # Compression protection: an interrupt would start a new turn on the pre-rotation parent
@@ -769,11 +780,9 @@ class GatewayInboundMixin:
         elif await self._session_has_compression_in_flight(_quick_key):
             _demote = "because context compression is in flight (#56391)"
         else:
-            await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
-            return None
+            return await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
         logger.info("PRIORITY interrupt demoted to queue for session %s %s", _quick_key, _demote)
-        self._queue_or_replace_pending_event(_quick_key, event)
-        return None
+        return self._queue_pending_reply(_quick_key, event)
 
     def _hm_quick_commands(self) -> dict:
         """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""
@@ -1841,7 +1850,7 @@ class GatewayInboundMixin:
         clear_published_gateway_message_host(self)
 
     def _schedule_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str, on_result=None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe)."""
         from gateway.run import safe_schedule_threadsafe
@@ -1875,14 +1884,21 @@ class GatewayInboundMixin:
                 return False
 
         def _log_result(completed) -> None:
+            outcome = None
             try:
-                if completed.result():
-                    return
-                what, exc = "was not routed", None
+                outcome = completed.result() is True
+                what, exc = "was not admitted", None
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
-                return
+                what, exc = "was cancelled; admission unknown", None
             except Exception as err:
-                what, exc = "failed", err
+                what, exc = "failed; admission unknown", err
+            if on_result is not None:
+                try:
+                    on_result(outcome)
+                except Exception:
+                    logger.warning("Plugin injection outcome callback failed", exc_info=True)
+            if outcome is True:
+                return
             logger.warning(
                 "Plugin message injection %s: plugin=%s session=%s", what, plugin_id, session_key, exc_info=exc,
             )
@@ -1924,7 +1940,7 @@ class GatewayInboundMixin:
         if adapter is None:
             return False
 
-        await adapter.handle_message(MessageEvent(
+        event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
@@ -1932,9 +1948,18 @@ class GatewayInboundMixin:
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
                 "gateway_session_strict": True,
             },
-        ))
+        )
+        from gateway.wake import WakeNotAccepted, admit_internal_event
+        try:
+            await admit_internal_event(adapter, event)
+        except WakeNotAccepted:
+            logger.warning(
+                "Plugin message injection not admitted: plugin=%s session=%s",
+                plugin_id, session_key,
+            )
+            return False
         logger.info(
-            "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
+            "Plugin message injection admitted: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,
         )
         return True

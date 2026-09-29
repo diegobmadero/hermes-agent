@@ -102,3 +102,27 @@ async def test_interrupt_promotes_internal_wake_queued_behind_discarded_human_he
     await _run_command(runner, adapter, source, key, _COMMAND_REASONS[0])
     assert adapter.restarted == [wake]
     assert runner._overflow_queue(key) == [later_human]
+
+
+@pytest.mark.asyncio
+async def test_stale_guard_heal_delivers_parked_internal_wake_once():
+    adapter, runner, source, key = _gateway()
+    # Use actual background processing/guards, not the recording override.
+    adapter._start_session_processing = BasePlatformAdapter._start_session_processing.__get__(adapter)
+    seen = []
+    async def handler(event):
+        seen.append(event.text)
+    adapter.set_message_handler(handler)
+    old_task = asyncio.create_task(asyncio.sleep(0))
+    await old_task
+    adapter._active_sessions[key] = asyncio.Event()
+    adapter._session_tasks[key] = old_task
+    wake = _event(source, "unstarted retained wake", internal=True)
+    adapter._pending_messages[key] = wake
+    assert adapter._heal_stale_session_lock(key) is True
+    tasks = list(adapter._background_tasks)
+    await asyncio.gather(*tasks)
+    assert seen == [wake.text]
+    assert key not in adapter._pending_messages
+    assert key not in adapter._active_sessions
+    assert adapter._heal_stale_session_lock(key) is False

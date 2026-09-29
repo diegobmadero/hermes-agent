@@ -3892,10 +3892,17 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        pending = self._pending_messages.get(session_key)
+        if pending is not None and not pending.internal:
+            self._pending_messages.pop(session_key, None)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
+        # Only the abandoned task is dead. A parked internal event has never
+        # started and must survive this cleanup just as it survives /stop.
+        if pending is not None and pending.internal:
+            if self._start_session_processing(pending, session_key):
+                self._pending_messages.pop(session_key, None)
         return True
 
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
