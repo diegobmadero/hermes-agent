@@ -211,3 +211,28 @@ async def test_guard_is_inert_with_stubbed_session_store(tmp_path):
     assert runner._is_session_running(key) is True
     assert result is None
     assert agent.interrupts == ["stub store follow-up"]
+
+
+@pytest.mark.parametrize("child_ended", [False, True])
+def test_compression_continuation_is_not_a_dead_runtime(tmp_path, child_ended):
+    """Publication precedes route rebinding; only a genuinely dead tip is evicted."""
+    store = _store(tmp_path)
+    src = _source()
+    entry = store.get_or_create_session(src)
+    key, parent = entry.session_key, entry.session_id
+    runner = _make_runner(store)
+    agent = _DeadReapedAgent()
+    _occupy_turn_slot(runner, key, agent)
+    store._db.publish_compression_child(
+        parent_session_id=parent, child_session_id="compression-child", source="telegram",
+        messages=[{"role": "user", "content": "compressed handoff"}],
+        require_compression_lease=False,
+    )
+    assert store.peek_session_id(key) == parent
+    if child_ended:
+        store._db.end_session("compression-child", "ws_orphan_reap")
+    with patch.object(GatewayRunner, "_persist_active_agents", lambda self: None):
+        runner._hm_evict_reaped_agent(key)
+    assert agent.interrupts == ([_INTERRUPT_REASON_EVICTED] if child_ended else [])
+    assert runner._is_session_running(key) is (not child_ended)
+    store._db.close()

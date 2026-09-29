@@ -602,6 +602,7 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        on_result: Callable[[bool | None], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -609,21 +610,42 @@ class PluginContext:
         from the messaging gateway and queue onto the live session named by ``session_key``
         (the durable key, not the ephemeral UI session id). Non-CLI injection needs that
         ``session_key`` plus ``plugins.entries.<plugin_id>.allow_gateway_injection``.
-        ``True`` means a host accepted the request, not that the turn completed.
+        ``True`` means scheduled, not admitted or completed. Optional synchronous
+        ``on_result`` runs once: True = gateway admission, False = definite refusal,
+        None = unknown/untracked (including CLI/TUI). It may run on another thread;
+        keep it bounded. Never replay on None or infer model completion from True.
         """
+        reported = False
+        report_lock = threading.Lock()
+
+        def report(outcome):
+            nonlocal reported
+            with report_lock:
+                if reported:
+                    return
+                reported = True
+            if on_result is not None:
+                try:
+                    on_result(outcome)
+                except Exception:
+                    logger.warning("Plugin injection outcome callback failed", exc_info=True)
+
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
+            report(None)
             return True
         if not session_key:
             logger.warning("inject_message: gateway mode requires an existing session_key")
+            report(False)
             return False
         if not self._gateway_injection_allowed():
             logger.warning("inject_message: gateway injection denied for plugin %s; set "
                            "plugins.entries.%s.allow_gateway_injection: true to allow it",
                            self.plugin_id, self.plugin_id)
+            report(False)
             return False
         # TUI/desktop host is a different slot. It accepts only when it owns this
         # session_key; a miss falls through so a co-resident messaging gateway
@@ -634,21 +656,29 @@ class PluginContext:
                 if self._manager.inject_tui_message(
                     session_key=session_key, content=msg, plugin_id=self.plugin_id,
                 ):
+                    report(None)
                     return True
             except Exception:
                 logger.warning("inject_message: TUI scheduling failed for plugin %s", self.plugin_id,
                                exc_info=True)
+                report(None)
                 return False
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
+            report(False)
             return False
         try:
-            return bool(self._manager.inject_gateway_message(
+            scheduled = bool(self._manager.inject_gateway_message(
                 session_key=session_key, content=msg, plugin_id=self.plugin_id,
+                **({"on_result": report} if on_result is not None else {}),
             ))
+            if not scheduled:
+                report(False)
+            return scheduled
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)
+            report(None)
             return False
 
     def _gateway_injection_allowed(self) -> bool:
@@ -1278,7 +1308,21 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def inject_gateway_message(self, **kwargs: Any) -> bool:
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
-        return registered is not None and bool(registered[1](**kwargs))
+        if registered is None:
+            return False
+        callback = kwargs.get("on_result")
+        if callback is not None:
+            try:
+                params = inspect.signature(registered[1]).parameters
+                tracked = "on_result" in params
+            except (TypeError, ValueError):
+                tracked = False
+            if not tracked:
+                kwargs.pop("on_result")
+                scheduled = bool(registered[1](**kwargs))
+                callback(None if scheduled else False)
+                return scheduled
+        return bool(registered[1](**kwargs))
 
     @property
     def has_tui_message_injector(self) -> bool:

@@ -433,7 +433,15 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            pinned_tip = pinned_session_id
+            if session_entry is not None and pinned_session_id and session_entry.session_id != pinned_session_id:
+                # Compression continues the same conversation; /new and unrelated
+                # branches remain rejected by the canonical compression-only walk.
+                def live_compression_tip():
+                    tip = self.session_store._compression_tip_for_session_id(pinned_session_id)
+                    return tip if self.session_store._is_session_ended_in_db(tip) is False else None
+                pinned_tip = await asyncio.to_thread(live_compression_tip)
+            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_tip:
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",

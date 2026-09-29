@@ -148,7 +148,9 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
 
 @pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    async def admit(event):
+        event._gateway_accepted = True
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=admit))
     entry = _entry()
     runner = _runner(entry, adapter)
 
@@ -369,6 +371,58 @@ async def test_scheduler_logs_async_failure_without_callback_error():
 
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admission", [True, False, None])
+async def test_context_reports_async_gateway_outcome_once(monkeypatch, admission):
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+    monkeypatch.setattr(context, "_gateway_injection_allowed", lambda: True)
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    if admission is None:
+        runner._dispatch_plugin_message_injection = AsyncMock(side_effect=RuntimeError("unknown outcome"))
+    else:
+        runner._dispatch_plugin_message_injection = AsyncMock(return_value=admission)
+    manager.set_gateway_message_injector(runner, runner._schedule_plugin_message_injection)
+    outcomes = []
+    assert context.inject_message("wake", session_key="key", on_result=outcomes.append) is True
+    await asyncio.gather(*list(runner._background_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert outcomes == [admission]
+
+
+@pytest.mark.asyncio
+async def test_outcome_callback_failure_does_not_change_admission(monkeypatch):
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    callback = MagicMock(side_effect=RuntimeError("observer failed"))
+    assert runner._schedule_plugin_message_injection(
+        session_key="key", content="wake", plugin_id="notify", on_result=callback) is True
+    tasks = list(runner._background_tasks)
+    assert await asyncio.gather(*tasks) == [True]
+    await asyncio.sleep(0)
+    callback.assert_called_once_with(True)
+
+
+@pytest.mark.parametrize("kwargs_only", [False, True])
+def test_tracked_context_keeps_legacy_injector_compatible(monkeypatch, kwargs_only):
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="notify-plugin", key="notify-plugin", source="user"), manager)
+    monkeypatch.setattr(context, "_gateway_injection_allowed", lambda: True)
+    calls, outcomes = [], []
+    def legacy(*, session_key, content, plugin_id):
+        calls.append(content)
+        return True
+    def legacy_kwargs(**kwargs):
+        calls.append(kwargs["content"])
+        return True
+    manager.set_gateway_message_injector(object(), legacy_kwargs if kwargs_only else legacy)
+    assert context.inject_message("wake", session_key="key", on_result=outcomes.append) is True
+    assert calls == ["wake"]
+    assert outcomes == [None]
+
+
 def test_scheduler_rejects_stopped_or_closed_gateway():
     runner = _runner(_entry())
     loop = MagicMock()
@@ -452,3 +506,83 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["collision", "cap", "queued"])
+async def test_dispatch_reports_real_adapter_admission(mode, caplog):
+    entry = _entry()
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    original = MessageEvent(text="human follow-up", source=entry.origin)
+    adapter._pending_messages[entry.session_key] = original
+    runner = _runner(entry, adapter)
+    if mode != "collision":
+        adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+        runner._BUSY_QUEUE_MAX_PENDING = 1 if mode == "cap" else 10
+    with caplog.at_level("INFO", logger="gateway.run"):
+        accepted = await runner._dispatch_plugin_message_injection(
+            session_key=entry.session_key, content="retained notification", plugin_id="notify-plugin",
+        )
+    assert accepted is (mode == "queued")
+    assert adapter._pending_messages[entry.session_key] is original
+    if mode != "queued":
+        assert "injection dispatched" not in caplog.text
+    else:
+        queued = runner._queued_events[entry.session_key][0]
+        assert queued._gateway_accepted is True
+        assert queued.text == "retained notification"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["interrupt", "steer"])
+async def test_internal_fast_path_only_queues(mode):
+    entry = _entry()
+    adapter = _RoutingAdapter()
+    runner = _runner(entry, adapter)
+    runner.config = GatewayConfig()
+    runner._effective_busy_input_mode = lambda source: mode
+    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+    runner._agent_has_active_subagents = lambda agent: False
+    agent = MagicMock()
+    runner._session_state(entry.session_key).turn.agent = agent
+    event = MessageEvent(text="plugin wake", source=entry.origin, internal=True,
+                         allow_gateway_control=False)
+    await runner._hm_handle_running_session_message(event, event.source, entry.session_key)
+    agent.interrupt.assert_not_called()
+    agent._fold_into_running_turn.assert_not_called()
+    assert adapter._pending_messages[entry.session_key] is event
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["compression", "reset", "ended-compression"])
+async def test_queued_plugin_wake_follows_only_compression(tmp_path, boundary):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    source = _entry().origin
+    entry = store.get_or_create_session(source)
+    parent = entry.session_id
+    store._db.publish_compression_child(
+        parent_session_id=parent, child_session_id="compressed", source="telegram",
+        messages=[{"role": "user", "content": "handoff"}], require_compression_lease=False,
+    )
+    entry.session_id = "manual-new" if boundary == "reset" else "compressed"
+    if boundary == "ended-compression":
+        store._db.end_session("compressed", "ws_orphan_reap")
+    runner = _runner(entry)
+    runner.config = GatewayConfig()
+    runner.session_store = store
+    runner._async_session_store._store = store
+    runner._cache_session_source = lambda *args: None
+    runner._is_telegram_topic_lane = lambda source: False
+    event = MessageEvent(text="queued wake", source=source, internal=True, allow_gateway_control=False,
+                         metadata={"gateway_session_key": entry.session_key,
+                                   "gateway_session_id": parent, "gateway_session_strict": True})
+    try:
+        result = await runner._hmwa_resolve_session(event, source)
+        if boundary == "compression":
+            assert result is not None
+            assert result[1].session_id == "compressed"
+        else:
+            assert result is None
+    finally:
+        store._db.close()
